@@ -1,0 +1,13 @@
+IDR501.map
+50 Marburg (512 km)
+projection = Gnomonic
+center_longitude =     152.53900
+center_latitude  =     -27.60800
+lon0 =     147.14708
+lat0 =     -32.07849
+lon1 =     147.58037
+lat1 =     -22.91182
+lon2 =     157.54222
+lat2 =     -22.91043
+lon3 =     157.97934
+lat3 =     -32.07642

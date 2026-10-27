@@ -1,0 +1,13 @@
+IDR661.map
+66 Brisbane (512 km)
+projection = Gnomonic
+center_longitude =     153.24001
+center_latitude  =     -27.71810
+lon0 =     147.83388
+lat0 =     -32.18437
+lon1 =     148.27060
+lat1 =     -23.00939
+lon2 =     158.24875
+lat2 =     -23.00815
+lon3 =     158.68889
+lat3 =     -32.18254

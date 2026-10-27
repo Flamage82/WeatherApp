@@ -1,0 +1,1 @@
+{ "name": "ftp-spike", "private": true, "version": "0.0.0", "devDependencies": { "wrangler": "^4", "@cloudflare/workers-types": "^4" } }
