@@ -14,6 +14,10 @@ import { FORECAST_MIN_OPACITY } from "../motion/interpolate";
  *    the texture-space mapping LINEAR filtering would use anyway.
  * So the GPU result equals the CPU result up to float32 rounding. The same chunk is used by the
  * parity check in `parity.ts`.
+ *
+ * Display-only exception: `u_smooth` swaps the bilinear level lookup for a smoother cubic one on
+ * the map (1 = cubic B-spline, the default; 2 = Catmull-Rom clamped to the 4 nearest cells).
+ * The CPU mirror and the parity check stay bilinear (u_smooth = 0, the uniform's default).
  */
 export const INTERP_GLSL = /* glsl */ `
 // Native cell c (k x k pixels, phase 0) has its value at texel c*k; cells outside the frame read 0.
@@ -38,6 +42,50 @@ float bilinearLevel(highp usampler2D t, vec2 p, int k) {
   return (v00 * (1.0 - f.x) + v10 * f.x) * (1.0 - f.y) + (v01 * (1.0 - f.x) + v11 * f.x) * f.y;
 }
 
+uniform int u_smooth; // 0 = bilinear, 1 = cubic B-spline, 2 = Catmull-Rom (display only)
+
+// Cubic B-spline weights for taps -1..2: all >= 0 and summing to 1, so it never exceeds the
+// neighbourhood max (no invented rain), but it softens a lone cell's peak.
+vec4 bsplineWeights(float t) {
+  float t2 = t * t, t3 = t2 * t, s = 1.0 - t;
+  return vec4(s * s * s, 3.0 * t3 - 6.0 * t2 + 4.0, -3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0, t3) / 6.0;
+}
+
+// Catmull-Rom weights for taps -1..2: passes through the cell values (keeps peaks) but overshoots,
+// so the caller clamps to the 4 nearest cells.
+vec4 catmullWeights(float t) {
+  float t2 = t * t, t3 = t2 * t;
+  return vec4(-t3 + 2.0 * t2 - t, 3.0 * t3 - 5.0 * t2 + 2.0, -3.0 * t3 + 4.0 * t2 + t, t3 - t2) * 0.5;
+}
+
+// 4x4-tap cubic between native cell centres; same cell mapping as bilinearLevel.
+float cubicLevel(highp usampler2D t, vec2 p, int k, bool catmull) {
+  float kf = float(k);
+  vec2 q = (p - 0.5 * (kf - 1.0)) / kf;
+  vec2 q0 = floor(q);
+  vec2 f = q - q0;
+  ivec2 c = ivec2(q0);
+  vec4 wx = catmull ? catmullWeights(f.x) : bsplineWeights(f.x);
+  vec4 wy = catmull ? catmullWeights(f.y) : bsplineWeights(f.y);
+  float s = 0.0, lo = 1e9, hi = -1e9;
+  for (int j = 0; j < 4; j++) {
+    float row = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float v = levelTap(t, c + ivec2(i - 1, j - 1), k);
+      row += wx[i] * v;
+      if ((i == 1 || i == 2) && (j == 1 || j == 2)) { lo = min(lo, v); hi = max(hi, v); }
+    }
+    s += wy[j] * row;
+  }
+  return catmull ? clamp(s, lo, hi) : s;
+}
+
+float levelAt(highp usampler2D t, vec2 p, int k) {
+  if (u_smooth == 1) return cubicLevel(t, p, k, false);
+  if (u_smooth == 2) return cubicLevel(t, p, k, true);
+  return bilinearLevel(t, p, k);
+}
+
 // flowAt: cell (i, j) centred at full-res ((i+1)*512/(gw+1), (j+1)*512/(gh+1)); clamped to edge.
 vec2 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
   vec2 gs = vec2(size);
@@ -59,14 +107,14 @@ vec2 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
 float sampleInterpolated(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize,
                          float alpha, vec2 p, int k) {
   vec2 F = flowAt(fl, fsize, p);
-  float wa = bilinearLevel(a, p - alpha * F, k);
-  float wb = bilinearLevel(b, p + (1.0 - alpha) * F, k);
+  float wa = levelAt(a, p - alpha * F, k);
+  float wb = levelAt(b, p + (1.0 - alpha) * F, k);
   return min((1.0 - alpha) * wa + alpha * wb, max(wa, wb));
 }
 
 // Nowcast (see interpolate.ts sampleForecast): V = flowAt(p) in px/ms; result = A(p - leadMs*V).
 float sampleForecast(highp usampler2D a, highp sampler2D v, ivec2 vsize, float leadMs, vec2 p, int k) {
-  return bilinearLevel(a, p - leadMs * flowAt(v, vsize, p), k);
+  return levelAt(a, p - leadMs * flowAt(v, vsize, p), k);
 }
 
 // interpolate.ts forecastOpacity: 1 at lead 0, fading linearly to FORECAST_MIN_OPACITY at NOWCAST_MAX_MS.

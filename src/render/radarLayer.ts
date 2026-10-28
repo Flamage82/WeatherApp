@@ -29,8 +29,14 @@ type Program = {
   loc: Record<string, WebGLUniformLocation | null>;
 };
 
+/** Map level lookup, from `?smooth=` (0 = bilinear, cr = Catmull-Rom, else B-spline). For comparing looks. */
+const SMOOTH_MODE = (() => {
+  const v = typeof location === "undefined" ? null : new URLSearchParams(location.search).get("smooth");
+  return v === "0" ? 0 : v === "cr" ? 2 : 1;
+})();
+
 const UNIFORMS = [
-  "u_matrix", "u_mix", "u_lut",
+  "u_matrix", "u_mix", "u_lut", "u_smooth",
   ...[0, 1].flatMap((s) =>
     ["u_a", "u_b", "u_flow", "u_flowSize", "u_alpha", "u_lead", "u_cell", "u_centre", "u_extent"].map((n) => `${n}${s}`)),
 ];
@@ -279,6 +285,7 @@ export class RadarLayer implements CustomLayerInterface {
     gl.useProgram(P.prog);
     gl.uniformMatrix4fv(P.loc.u_matrix!, false, options.defaultProjectionData.mainMatrix as Float32List);
     gl.uniform1f(P.loc.u_mix!, mix);
+    gl.uniform1i(P.loc.u_smooth!, SMOOTH_MODE);
     // Unbound slots still need valid textures of the right type; reuse the side that exists.
     this.bindSlot(gl, P, 0, own ? this : other!, (own ?? theirs)!);
     this.bindSlot(gl, P, 1, theirs ? other! : this, (theirs ?? own)!);
