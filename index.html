@@ -4,6 +4,19 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Rain radar</title>
+    <style>
+      /* Outline of the tape and the speed lever, so they stand out from a dark map (light theme: dark). */
+      :root {
+        --control-border: rgba(255, 255, 255, 0.3);
+        --control-shadow: 0 1px 6px rgba(0, 0, 0, 0.5);
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --control-border: rgba(0, 0, 0, 0.3);
+          --control-shadow: 0 1px 6px rgba(0, 0, 0, 0.2);
+        }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>

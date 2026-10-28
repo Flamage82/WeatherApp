@@ -8,13 +8,18 @@ const LABELS = [4, 2, 0, -2, -4];
 export const fmtSpeed = (s: number) =>
   s === 0 ? "0" : `${s < 0 ? "−" : ""}${Number.isInteger(s) ? Math.abs(s) : Math.abs(s).toFixed(1)}×`;
 
-type Props = { speed: number; onChange(speed: number): void };
+type Props = {
+  speed: number;
+  onChange(speed: number): void;
+  /** True while a pointer holds the lever. */
+  onHold?(held: boolean): void;
+};
 
 /**
  * The speed lever (spec §6.3): vertical, −4× at the bottom to +4× at the top, with light detents.
  * Press or drag anywhere on it (pointer-captured); it stays where it's left.
  */
-export function SpeedLever({ speed, onChange }: Props) {
+export function SpeedLever({ speed, onChange, onHold }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   // Knob centre travels between KNOB/2 from the top and from the bottom.
   const yOf = (pos: number) => `calc(${KNOB / 2}px + (100% - ${KNOB}px) * ${1 - pos})`;
@@ -36,12 +41,14 @@ export function SpeedLever({ speed, onChange }: Props) {
       data-testid="speed-lever"
       onPointerDown={(e) => {
         e.currentTarget.setPointerCapture(e.pointerId);
+        onHold?.(true);
         update(e);
       }}
       onPointerMove={(e) => e.currentTarget.hasPointerCapture(e.pointerId) && update(e)}
+      onLostPointerCapture={() => onHold?.(false)}
       style={{
         position: "relative", width: 40, height: "100%", borderRadius: 20, boxSizing: "border-box",
-        background: "rgba(0,0,0,0.45)", border: "1px solid rgba(255,255,255,0.15)",
+        background: "rgba(0,0,0,0.45)", border: "1px solid var(--control-border)", boxShadow: "var(--control-shadow)",
         touchAction: "none", userSelect: "none", cursor: "ns-resize",
         font: "700 10px system-ui, sans-serif", color: "#c9d4df",
       }}

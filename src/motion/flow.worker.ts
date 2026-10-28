@@ -21,5 +21,5 @@ ctx.onmessage = (e) => {
   } catch (err) {
     console.error("computeFlow failed; replying with a zero flow", err);
   }
-  ctx.postMessage({ id, flow }, [flow.data.buffer]);
+  ctx.postMessage({ id, flow }, flow.valid ? [flow.data.buffer, flow.valid.buffer] : [flow.data.buffer]);
 };

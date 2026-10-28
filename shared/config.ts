@@ -66,3 +66,5 @@ export const RADARS: {
 export const MANIFEST_SPAN_MS = 86_400_000;
 export const DEFAULT_WINDOW_MS = 7_200_000;
 export const MAX_FLOW_GAP_MS = 900_000;
+/** The nowcast runs this far past the newest frame (client-side, spec §9). */
+export const NOWCAST_MAX_MS = 3_600_000;

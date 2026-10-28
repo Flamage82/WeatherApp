@@ -19,7 +19,7 @@ type Slot = { product: ProductId; layer: RadarLayer; drawn: boolean };
  *   `ensureProduct`, wait until it has a pair, then crossfade over CROSSFADE_MS with
  *   `RadarLayer.setCrossfade` and finish by the hand-off contract (remove current, add next).
  *   While a fade runs, picks are deferred to its end. Panning within the same range does nothing.
- * - `t === null` means live: the newest loaded frame.
+ * - `t === null` means live: the newest loaded frame. A `t` past it draws the store's nowcast.
  */
 export class RadarView {
   private cur: Slot | null = null;
@@ -120,7 +120,7 @@ export class RadarView {
     if (g && s.layer.geometry !== g) s.layer.setGeometry(g);
     const pair = this.store.getPair(s.product, t);
     if (pair && s.layer.geometry) {
-      s.layer.setPair(pair.a, pair.b, pair.flow, pair.alpha);
+      s.layer.setPair(pair.a, pair.b, pair.flow, pair.alpha, pair.forecastLeadMs ?? 0);
       s.drawn = true;
     }
   }

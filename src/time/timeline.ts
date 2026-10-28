@@ -1,4 +1,4 @@
-import { DEFAULT_WINDOW_MS, MAX_FLOW_GAP_MS } from "../../shared/config";
+import { MAX_FLOW_GAP_MS } from "../../shared/config";
 
 /** Radar-ms advanced per real-ms at 1x speed (10 min of radar time per 1 s). */
 export const SPEED_SCALE = 600;
@@ -6,17 +6,12 @@ export const SPEED_SCALE = 600;
 /** Largest real-time step accepted by stepPlayback, so a stalled tab cannot jump. */
 const MAX_DT_MS = 100;
 
-/** How long playback rests on a window edge before wrapping to the other edge. */
-const HOLD_MS = 1000;
-
 export type PlayState = {
   t: number;
   /** −4..4; 0 = paused. */
   speed: number;
   /** Last non-zero speed, so resuming from pause can restore it. */
   lastSpeed: number;
-  /** Time spent resting on the window edge in the direction of travel. */
-  holdMs: number;
 };
 
 /**
@@ -53,54 +48,32 @@ export function locate(
 export const isFlowGap = (gapMs: number): boolean => gapMs > MAX_FLOW_GAP_MS;
 
 /**
- * Advances playback by `dtMs` of real time within `win`.
+ * Advances playback by `dtMs` of real time. `bounds`: `start`..`end` is where the playhead may go
+ * (the loaded start to the end of the nowcast) and `now` is the newest frame.
  *
  * - speed 0 returns the state unchanged.
- * - A `t` outside the window is clamped into it first.
- * - Reaching an edge in the direction of travel clamps `t` to that edge and starts
- *   `holdMs`. After HOLD_MS of hold, `t` wraps to the opposite edge and `holdMs` resets.
- * - Reversing direction while holding cancels the hold.
+ * - A `t` outside the bounds is clamped into them first.
+ * - Reaching `start` or `end` in the direction of travel stops there (speed 0, lastSpeed kept). No loop.
+ * - Crossing `now` (from either side) stops exactly at `now`, unless `manual` (the user is dragging
+ *   the tape or holding the lever). Starting at `now` is not a crossing, so Play at `now` runs on.
  */
 export function stepPlayback(
   s: PlayState,
   dtMs: number,
-  win: { start: number; end: number },
+  bounds: { start: number; end: number; now: number },
+  manual = false,
 ): PlayState {
   if (s.speed === 0) return s;
 
   const dt = Math.min(dtMs, MAX_DT_MS);
   const dir = Math.sign(s.speed);
-  const edge = dir > 0 ? win.end : win.start;
-  const t = Math.min(Math.max(s.t, win.start), win.end);
-
-  if (t === edge) {
-    const holdMs = s.holdMs + dt;
-    if (holdMs >= HOLD_MS) {
-      return { ...s, t: dir > 0 ? win.start : win.end, holdMs: 0 };
-    }
-    return { ...s, t, holdMs };
-  }
-
+  const t = Math.min(Math.max(s.t, bounds.start), bounds.end);
   const next = t + dir * dt * SPEED_SCALE * Math.abs(s.speed);
-  const reached = dir > 0 ? next >= win.end : next <= win.start;
-  if (reached) return { ...s, t: edge, holdMs: dt };
-  return { ...s, t: next, holdMs: 0 };
-}
+  const stop = (at: number): PlayState => ({ ...s, t: at, speed: 0 });
 
-/**
- * A window of length `spanMs` centred on `t`, shifted back so that `end <= newestMs`.
- */
-export function loopWindow(
-  t: number,
-  newestMs: number,
-  spanMs = DEFAULT_WINDOW_MS,
-): { start: number; end: number } {
-  let start = t - spanMs / 2;
-  let end = start + spanMs;
-  const excess = end - newestMs;
-  if (excess > 0) {
-    start -= excess;
-    end -= excess;
+  if (!manual && (dir > 0 ? t < bounds.now && next >= bounds.now : t > bounds.now && next <= bounds.now)) {
+    return stop(bounds.now);
   }
-  return { start, end };
+  if (dir > 0 ? next >= bounds.end : next <= bounds.start) return stop(dir > 0 ? bounds.end : bounds.start);
+  return { ...s, t: next };
 }

@@ -1,10 +1,17 @@
 import { formatClock } from "./formatClock";
 
-type Props = { t: number; now: number };
+type Props = {
+  t: number;
+  now: number;
+  /** The newest frame: past it the clock shows the nowcast's lead. */
+  newestMs: number | null;
+  /** The "rain at home" line (`rainHint`), or null for none. */
+  hint: string | null;
+};
 
-/** The displayed time, large at the top centre, with its age underneath (spec §6.1). */
-export function Clock({ t, now }: Props) {
-  const { time, rel } = formatClock(t, now);
+/** The displayed time, large at the top centre, with its age (or nowcast lead) and the rain hint underneath (spec §6.1, §9). */
+export function Clock({ t, now, newestMs, hint }: Props) {
+  const { time, rel } = formatClock(t, now, newestMs);
   return (
     <div
       data-testid="clock"
@@ -17,7 +24,8 @@ export function Clock({ t, now }: Props) {
       }}
     >
       {time}
-      <div style={{ font: "500 12px system-ui, sans-serif", color: "#c3cfdb" }}>{rel}</div>
+      <div style={{ font: "500 12px system-ui, sans-serif", color: newestMs !== null && t > newestMs ? "#c4b5fd" : "#c3cfdb" }}>{rel}</div>
+      {hint && <div data-testid="rain-hint" style={{ font: "600 12px system-ui, sans-serif", color: "#93c5fd" }}>{hint}</div>}
     </div>
   );
 }

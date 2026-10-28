@@ -1,11 +1,12 @@
 import { useEffect, useRef } from "react";
-import { RADARS, type ProductId } from "../../shared/config";
+import { NOWCAST_MAX_MS, RADARS, type ProductId } from "../../shared/config";
 import { msToStamp } from "../../shared/stamps";
 import type { SeriesDay } from "../../shared/types";
 import { fetchSeries } from "../data/api";
 import type { FrameStore } from "../data/frameStore";
+import { forecastOpacity } from "../motion/interpolate";
 import { MAX_LEVEL, rampColour } from "../render/colourRamp";
-import { buildHomeSeries } from "./homeSeries";
+import { buildHomeForecast, buildHomeSeries } from "./homeSeries";
 import {
   DEFAULT_SPAN_MS, SERIES_SOURCE_SWITCH_MS, SERIES_STEP_MS,
   flingStep, pxToMs, seriesToColumns, tickStepMs, zoomSpan,
@@ -30,6 +31,8 @@ const DAY_SETTLE_MS = 7_200_000;
 /** A failed series day is retried after this. */
 const SERIES_RETRY_MS = 30_000;
 const HATCH_PX = 6;
+/** Background of the nowcast section: a cool violet, distinct from the past (the tape's panel is dark in both themes). */
+const FORECAST_TINT = "rgba(167,139,250,0.16)";
 
 const fmtTime = new Intl.DateTimeFormat("en-AU", {
   timeZone: "Australia/Brisbane", hour: "numeric", minute: "2-digit", hour12: true,
@@ -47,8 +50,8 @@ const dayOf = (ms: number) => msToStamp(ms).slice(0, 8);
 
 type HomeSeries = { product: ProductId; fromMs: number; values: Float32Array };
 
-/** Level at `tc` from the 30 s home series, linear between steps (NaN where either step is). */
-function homeLevel(h: HomeSeries, tc: number): number {
+/** Level at `tc` from a 30 s home series, linear between steps (NaN where either step is). */
+function homeLevel(h: Pick<HomeSeries, "fromMs" | "values">, tc: number): number {
   const q = (tc - h.fromMs) / SERIES_STEP_MS, n = h.values.length;
   if (!(q >= 0 && q <= n - 1)) return NaN;
   if (n === 1) return h.values[0]!;
@@ -62,9 +65,11 @@ type Props = {
   /** Playhead time (ms), drawn at the centre. */
   t: number;
   spanMs: number;
-  /** Called with the new playhead time, already clamped to the store's loaded window. */
+  /** Called with the new playhead time, already clamped to the loaded start .. the nowcast's end. */
   onScrub(tMs: number): void;
   onSpanChange(spanMs: number): void;
+  /** True while the user drives the tape: a pointer is down, or a fling is coasting. */
+  onGesture?(active: boolean): void;
 };
 
 /**
@@ -73,12 +78,14 @@ type Props = {
  * the playhead; double-tap resets the span. Its source is the active radar's tape product, whatever the
  * map shows: up to 3 h of span the interpolated 30 s series from the decoded pairs (`buildHomeSeries`),
  * above that the server's per-frame series (`fetchSeries`, one UTC day file each, cached). Where neither
- * has a value yet the tape shows a faint hatch.
+ * has a value yet the tape shows a faint hatch. Past the newest frame ("now") comes the nowcast, up to
+ * NOWCAST_MAX_MS: a tinted section whose graph is the client nowcast at home (`buildHomeForecast`, at any
+ * span), faded as the map fades it. Beyond that the tape is shaded.
  */
-export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
+export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const props = useRef({ onScrub, onSpanChange });
-  props.current = { onScrub, onSpanChange };
+  const props = useRef({ onScrub, onSpanChange, onGesture });
+  props.current = { onScrub, onSpanChange, onGesture };
   // The tape's own view of time and span: updated at once by gestures, re-synced from props on render.
   const tRef = useRef(t);
   const spanRef = useRef(spanMs);
@@ -149,7 +156,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
 
       const t = tRef.current, span = spanRef.current;
       const from = t - span / 2, to = t + span / 2;
-      const end = store.loadedWindow().end;
+      const end = store.loadedWindow().end, fcEnd = end + NOWCAST_MAX_MS;
       const xOf = (ms: number) => ((ms - from) / span) * w;
       const graphH = h - LABEL_H;
       const cols = Math.max(1, Math.round(w)), colW = w / cols, colMs = span / cols;
@@ -162,8 +169,22 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
       } else if (p) {
         levels = seriesToColumns(dayPoints(p, from - colMs, Math.min(to, end) + colMs), from, to, cols);
       }
+      // Nowcast columns, at any span.
+      const geom = p && to > end ? store.geometry(p) : null;
+      const fc = p && geom ? buildHomeForecast(store, p, geom) : null;
+      for (let c = 0; c < cols; c++) {
+        const tc = from + (c + 0.5) * colMs;
+        if (tc > end) levels[c] = fc ? homeLevel(fc, tc) : NaN;
+      }
 
-      // Graph, and a hatch (scrolling with the tape) where there's no value yet. Nothing after the newest frame.
+      // The nowcast section's tint, under the graph.
+      if (end < to && fcEnd > from) {
+        const x0 = Math.max(0, xOf(end)), x1 = Math.min(w, xOf(fcEnd));
+        ctx.fillStyle = FORECAST_TINT;
+        ctx.fillRect(x0, 0, x1 - x0, graphH);
+      }
+
+      // Graph, and a hatch (scrolling with the tape) where there's no value yet. Nothing after the nowcast.
       hatch?.setTransform(new DOMMatrix([1, 0, 0, 1, xOf(0) % HATCH_PX, 0]));
       let hatchFrom = -1;
       const flushHatch = (c: number) => {
@@ -173,7 +194,8 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
         hatchFrom = -1;
       };
       for (let c = 0; c < cols; c++) {
-        if (from + (c + 0.5) * colMs > end) { flushHatch(c); break; }
+        const tc = from + (c + 0.5) * colMs;
+        if (tc > fcEnd) { flushHatch(c); break; }
         const v = levels[c]!;
         if (Number.isNaN(v)) {
           if (hatchFrom < 0) hatchFrom = c;
@@ -183,18 +205,21 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
         if (v <= 0) continue;
         const [r, g, b, a] = rampColour(v);
         const bar = Math.max(1, (Math.min(v, MAX_LEVEL) / MAX_LEVEL) * graphH);
-        ctx.fillStyle = `rgba(${r},${g},${b},${a / 255})`;
+        const fade = tc > end ? forecastOpacity(tc - end) : 1;
+        ctx.fillStyle = `rgba(${r},${g},${b},${(a / 255) * fade})`;
         ctx.fillRect(c * colW, graphH - bar, colW + 0.5, bar);
       }
       flushHatch(cols);
 
-      // The future (past the newest frame) is shaded, with a line at "now".
-      if (end < to) {
-        const x = Math.max(0, xOf(end));
+      // Beyond the nowcast there's no data: shaded. A line at "now".
+      if (fcEnd < to) {
+        const x = Math.max(0, xOf(fcEnd));
         ctx.fillStyle = "rgba(0,0,0,0.35)";
         ctx.fillRect(x, 0, w - x, h);
+      }
+      if (end >= from && end < to) {
         ctx.fillStyle = "rgba(255,255,255,0.35)";
-        ctx.fillRect(x, 0, 1, graphH);
+        ctx.fillRect(xOf(end), 0, 1, graphH);
       }
 
       // Ticks and labels on local (Brisbane) multiples of the step; a label that would overlap is skipped.
@@ -253,7 +278,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
 
     const scrubTo = (target: number): number => {
       const { start, end } = store.loadedWindow();
-      const c = Math.min(Math.max(target, start), end);
+      const c = Math.min(Math.max(target, start), end + NOWCAST_MAX_MS);
       tRef.current = c;
       props.current.onScrub(c);
       requestDraw.current();
@@ -265,9 +290,15 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
       props.current.onSpanChange(s);
       requestDraw.current();
     };
+    let active = false;
+    const syncActive = () => {
+      const a = pointers.size > 0 || fling !== 0;
+      if (a !== active) props.current.onGesture?.((active = a));
+    };
     const stopFling = () => {
       cancelAnimationFrame(fling);
       fling = 0;
+      syncActive();
     };
     const startFling = (v0: number) => {
       let v = v0, last = performance.now();
@@ -278,10 +309,15 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
         v = flingStep(v, dt, (FLING_STOP_PX * spanRef.current) / (canvas.clientWidth * FRAME_MS));
         const target = tRef.current + v * dt;
         // Stop when friction wins or the tape hits either end of what's loaded.
-        if (v === 0 || scrubTo(target) !== target) fling = 0;
-        else fling = requestAnimationFrame(step);
+        if (v === 0 || scrubTo(target) !== target) {
+          fling = 0;
+          syncActive();
+        } else {
+          fling = requestAnimationFrame(step);
+        }
       };
       fling = requestAnimationFrame(step);
+      syncActive();
     };
     const pinchDistance = () => {
       const [a, b] = [...pointers.values()];
@@ -292,6 +328,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
       canvas.setPointerCapture(e.pointerId);
       stopFling();
       pointers.set(e.pointerId, e.clientX);
+      syncActive();
       if (pointers.size === 1) {
         lastX = e.clientX;
         samples = [{ at: e.timeStamp, t: tRef.current }];
@@ -318,6 +355,11 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange }: Props) {
     };
     const onUp = (e: PointerEvent) => {
       if (!pointers.delete(e.pointerId)) return;
+      release(e);
+      syncActive();
+    };
+    /** A pointer went up (already removed from `pointers`): end a pinch, detect a double tap, or fling. */
+    const release = (e: PointerEvent) => {
       if (pinch) {
         if (pointers.size < 2) pinch = null;
         if (pointers.size === 1) {

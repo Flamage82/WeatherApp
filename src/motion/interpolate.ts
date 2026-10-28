@@ -1,4 +1,4 @@
-import type { CellSize } from "../../shared/config";
+import { NOWCAST_MAX_MS, type CellSize } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import { flowAt, type FlowField } from "./flow";
 
@@ -43,14 +43,27 @@ export function sampleInterpolated(
 }
 
 /**
- * Maximum sampleInterpolated over the native cell centres (pixel k*c + (k-1)/2) within radius rPx of
- * (cx, cy), cells inside the frame only: the same cells `maxLevelInDisc` reads, so at a frame's own time
- * (alpha 0, or 1 on B) both give the same value. With k = 1 the centres are the integer pixels.
+ * Nowcast level at full-res pixel p = (x, y), `leadMs` past frame A (the newest frame), with `v` from
+ * `forecastFlow` (px per ms). Semi-Lagrangian backward advection at constant velocity; the shader
+ * reproduces exactly this:
+ *   V = flowAt(v, x, y);   result = A(p - leadMs*V)   (cell bilinear, out-of-bounds = 0)
  */
-export function sampleInterpolatedMaxInDisc(
-  a: LevelField, b: LevelField, f: FlowField, alpha: number, cx: number, cy: number, rPx: number,
-  cell: CellSize = 1,
+export function sampleForecast(
+  a: LevelField, v: FlowField, leadMs: number, x: number, y: number, cell: CellSize = 1,
 ): number {
+  const [vx, vy] = flowAt(v, x, y);
+  return bilinear(a, x - leadMs * vx, y - leadMs * vy, cell);
+}
+
+/** Opacity of the nowcast at `leadMs`: 1 at the newest frame, fading linearly to this at NOWCAST_MAX_MS. */
+export const FORECAST_MIN_OPACITY = 0.55;
+
+export function forecastOpacity(leadMs: number): number {
+  return 1 - (1 - FORECAST_MIN_OPACITY) * Math.min(1, Math.max(0, leadMs / NOWCAST_MAX_MS));
+}
+
+/** Max of `sample(x, y)` over the native cell centres (pixel k*c + (k-1)/2) within rPx of (cx, cy), inside the frame. */
+function maxInDisc(cx: number, cy: number, rPx: number, cell: CellSize, sample: (x: number, y: number) => number): number {
   let m = 0;
   const r2 = rPx * rPx;
   const h = (cell - 1) / 2, last = 512 / cell - 1;
@@ -59,7 +72,26 @@ export function sampleInterpolatedMaxInDisc(
   for (let qy = c0(cy); qy <= c1(cy); qy++)
     for (let qx = c0(cx); qx <= c1(cx); qx++) {
       const x = qx * cell + h, y = qy * cell + h;
-      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) m = Math.max(m, sampleInterpolated(a, b, f, alpha, x, y, cell));
+      if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) m = Math.max(m, sample(x, y));
     }
   return m;
+}
+
+/**
+ * Maximum sampleInterpolated over the native cell centres (pixel k*c + (k-1)/2) within radius rPx of
+ * (cx, cy), cells inside the frame only: the same cells `maxLevelInDisc` reads, so at a frame's own time
+ * (alpha 0, or 1 on B) both give the same value. With k = 1 the centres are the integer pixels.
+ */
+export function sampleInterpolatedMaxInDisc(
+  a: LevelField, b: LevelField, f: FlowField, alpha: number, cx: number, cy: number, rPx: number,
+  cell: CellSize = 1,
+): number {
+  return maxInDisc(cx, cy, rPx, cell, (x, y) => sampleInterpolated(a, b, f, alpha, x, y, cell));
+}
+
+/** As sampleInterpolatedMaxInDisc, for the nowcast (`sampleForecast`). */
+export function sampleForecastMaxInDisc(
+  a: LevelField, v: FlowField, leadMs: number, cx: number, cy: number, rPx: number, cell: CellSize = 1,
+): number {
+  return maxInDisc(cx, cy, rPx, cell, (x, y) => sampleForecast(a, v, leadMs, x, y, cell));
 }

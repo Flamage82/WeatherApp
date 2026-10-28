@@ -7,7 +7,8 @@ import { buildRampLUT, LUT_SIZE } from "./colourRamp";
 import { gnomonicUniforms, mercQuad, unionQuad, type GnomonicUniforms } from "./geometryUniforms";
 import { FRAGMENT_SHADER, VERTEX_SHADER } from "./shaders";
 
-type Pair = { a: LevelField; b: LevelField; flow: FlowField; alpha: number };
+/** `leadMs` > 0: the nowcast that far past A (`flow` is then the forecast flow, px/ms; b is unused). */
+type Pair = { a: LevelField; b: LevelField; flow: FlowField; alpha: number; leadMs: number };
 
 /** GPU copies of one layer's current pair. Uploads happen lazily inside render(). */
 type FrameTextures = {
@@ -31,7 +32,7 @@ type Program = {
 const UNIFORMS = [
   "u_matrix", "u_mix", "u_lut",
   ...[0, 1].flatMap((s) =>
-    ["u_a", "u_b", "u_flow", "u_flowSize", "u_alpha", "u_cell", "u_centre", "u_extent"].map((n) => `${n}${s}`)),
+    ["u_a", "u_b", "u_flow", "u_flowSize", "u_alpha", "u_lead", "u_cell", "u_centre", "u_extent"].map((n) => `${n}${s}`)),
 ];
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string): WebGLShader {
@@ -89,7 +90,8 @@ let nextId = 0;
 
 /**
  * MapLibre custom layer drawing one radar product: frame pair (A, B) warped and blended at
- * `alpha` by the A->B flow (exactly `sampleInterpolated`), reprojected from the frame's gnomonic
+ * `alpha` by the A->B flow (exactly `sampleInterpolated`), or the nowcast `leadMs` past A (exactly
+ * `sampleForecast`, faded by `forecastOpacity`), reprojected from the frame's gnomonic
  * projection onto Web Mercator, coloured with the ramp. Mercator only (no globe).
  *
  * Crossfade (range changes): `setCrossfade(other, mix)` makes THIS layer also draw `other`, in the
@@ -132,8 +134,8 @@ export class RadarLayer implements CustomLayerInterface {
     this.repaint();
   }
 
-  setPair(a: LevelField, b: LevelField, flow: FlowField, alpha: number): void {
-    this.pair = { a, b, flow, alpha: Math.min(1, Math.max(0, alpha)) };
+  setPair(a: LevelField, b: LevelField, flow: FlowField, alpha: number, leadMs = 0): void {
+    this.pair = { a, b, flow, alpha: Math.min(1, Math.max(0, alpha)), leadMs: Math.max(0, leadMs) };
     this.repaint();
   }
 
@@ -254,6 +256,7 @@ export class RadarLayer implements CustomLayerInterface {
     const pair = layer.pair!, gu = layer.gu!;
     gl.uniform2i(u("u_flowSize"), pair.flow.gw, pair.flow.gh);
     gl.uniform1f(u("u_alpha"), pair.alpha);
+    gl.uniform1f(u("u_lead"), pair.leadMs);
     gl.uniform1i(u("u_cell"), layer.cell);
     gl.uniform2f(u("u_centre"), gu.lat0, gu.lon0);
     gl.uniform4f(u("u_extent"), gu.xMin, gu.xMax, gu.yMin, gu.yMax);

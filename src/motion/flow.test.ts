@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { LevelField } from "../../shared/decodeFrame";
-import { computeFlow, flowAt, ZERO_FLOW } from "./flow";
+import { computeFlow, flowAt, forecastFlow, ZERO_FLOW, type FlowField } from "./flow";
 
 export function makeDisc(cx: number, cy: number, r: number, level: number, into?: LevelField): LevelField {
   const f: LevelField = into ?? { width: 512, height: 512, data: new Uint8Array(512 * 512) };
@@ -42,5 +42,35 @@ describe("computeFlow", () => {
     const ms = performance.now() - t0;
     console.log(`computeFlow took ${ms.toFixed(1)} ms`);
     expect(ms).toBeLessThan(500);
+  });
+});
+
+describe("forecastFlow", () => {
+  /** A textured square of rain (pseudo-random 8 px tiles), shifted by (dx, dy). */
+  const patch = (dx: number, dy: number): LevelField => {
+    const f = empty();
+    for (let y = 150; y < 300; y++)
+      for (let x = 150; x < 300; x++) {
+        const tx = (x - 150) >> 3, ty = (y - 150) >> 3;
+        f.data[(y + dy) * 512 + x + dx] = 1 + (((tx * 73856093) ^ (ty * 19349663)) >>> 0) % 15;
+      }
+    return f;
+  };
+
+  it("fills a far empty corner with the patch's motion, in px/ms", () => {
+    const v = forecastFlow([computeFlow(patch(0, 0), patch(16, 8))], [300_000]);
+    for (const [x, y] of [[500, 500], [10, 500], [500, 10]] as const) {
+      const [vx, vy] = flowAt(v, x, y);
+      expect(Math.abs(vx / (16 / 300_000) - 1)).toBeLessThan(0.1);
+      expect(Math.abs(vy / (8 / 300_000) - 1)).toBeLessThan(0.1);
+    }
+  });
+
+  it("averages pair flows divided by their gaps", () => {
+    const uniform = (dx: number): FlowField => ({
+      gw: 31, gh: 31, data: new Float32Array(31 * 31 * 2).map((_, k) => (k % 2 ? 0 : dx)), valid: new Uint8Array(31 * 31).fill(1),
+    });
+    const v = forecastFlow([uniform(10), uniform(40)], [300_000, 600_000]);
+    expect(flowAt(v, 256, 256)[0]).toBeCloseTo((10 / 300_000 + 40 / 600_000) / 2, 10);
   });
 });

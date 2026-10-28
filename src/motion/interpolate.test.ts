@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { LevelField } from "../../shared/decodeFrame";
 import { computeFlow, ZERO_FLOW, flowAt } from "./flow";
-import { sampleInterpolated, sampleInterpolatedMaxInDisc } from "./interpolate";
+import { sampleForecast, sampleInterpolated, sampleInterpolatedMaxInDisc } from "./interpolate";
 
 function makeDisc(cx: number, cy: number, r: number, level: number): LevelField {
   const f: LevelField = { width: 512, height: 512, data: new Uint8Array(512 * 512) };
@@ -50,6 +50,15 @@ describe("sampleInterpolated", () => {
     const m = sampleInterpolatedMaxInDisc(a, a, ZERO_FLOW, 0.5, 215, 200, 10);
     expect(m).toBe(10);
     expect(sampleInterpolatedMaxInDisc(a, a, ZERO_FLOW, 0.5, 400, 400, 10)).toBe(0);
+  });
+});
+
+describe("sampleForecast", () => {
+  it("advects the newest frame along the forecast flow", () => {
+    const a = makeDisc(200, 200, 5, 10);
+    const v = { gw: 1, gh: 1, data: new Float32Array([1 / 60_000, 0]) }; // 1 px/min to the right
+    expect(sampleForecast(a, v, 10 * 60_000, 210, 200)).toBe(10);
+    expect(sampleForecast(a, v, 0, 210, 200)).toBe(0);
   });
 });
 

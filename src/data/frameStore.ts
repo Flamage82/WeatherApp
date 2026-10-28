@@ -1,10 +1,10 @@
 import {
-  CELL_SIZE, DEFAULT_WINDOW_MS, MANIFEST_SPAN_MS, RADARS, type CellSize, type ProductId,
+  CELL_SIZE, DEFAULT_WINDOW_MS, MANIFEST_SPAN_MS, NOWCAST_MAX_MS, RADARS, type CellSize, type ProductId,
 } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import { msToStamp, stampToMs } from "../../shared/stamps";
 import type { Manifest, RadarGeometry } from "../../shared/types";
-import type { FlowField } from "../motion/flow";
+import { FORECAST_PAIRS, forecastFlow, type FlowField } from "../motion/flow";
 import { locate } from "../time/timeline";
 import { chooseRadar, type RadarName } from "./chooseRadar";
 
@@ -32,8 +32,12 @@ export type FrameStoreDeps = {
  * What the layer draws at time t. `cell` is the product's native cell size (`CELL_SIZE[p]`),
  * included so CPU samplers (Task 12's tape) don't have to look it up; `RadarLayer` takes the same
  * value from the geometry itself.
+ * Past the newest frame it is the nowcast: `forecastLeadMs` > 0, a = b = the newest frame, `flow` is
+ * the forecast flow (px per ms, `forecastFlow`) and alpha is 0.
  */
-export type FramePair = { a: LevelField; b: LevelField; flow: FlowField; alpha: number; cell: CellSize };
+export type FramePair = {
+  a: LevelField; b: LevelField; flow: FlowField; alpha: number; cell: CellSize; forecastLeadMs?: number;
+};
 
 type ProductState = {
   p: ProductId;
@@ -58,6 +62,11 @@ type ProductState = {
   /** Earlier stamps of pairs whose flow request failed since the last refresh (not retried until then). */
   flowFailed: Set<number>;
   framesCache: number[] | null;
+  /**
+   * The nowcast base: the newest frame, its field and the forecast flow from `pairs` pair flows. Kept
+   * (holding its field) even if the decode window moves away, so the nowcast stays available.
+   */
+  forecast: { newest: number; a: LevelField; pairs: number; flow: FlowField } | null;
 };
 
 const dayOf = (ms: number) => msToStamp(ms).slice(0, 8);
@@ -212,12 +221,22 @@ export class FrameStore extends EventTarget {
     this.schedule();
   }
 
-  /** The pair to draw at `t` (clamped to the product's frames), or null if it isn't decoded yet. */
+  /**
+   * The pair to draw at `t`, or null if it isn't decoded yet. Before the product's first frame it is
+   * clamped to it; past its newest frame it is the nowcast (lead clamped to NOWCAST_MAX_MS).
+   */
   getPair(p: ProductId, t: number): FramePair | null {
     const ps = this.products.get(p);
     if (!ps) return null;
     const fr = this.frames(p);
     if (fr.length < 2) return null;
+    const newest = fr[fr.length - 1]!;
+    if (t > newest) {
+      const fc = this.forecastOf(ps, fr);
+      if (!fc) return null;
+      const forecastLeadMs = Math.min(t - newest, NOWCAST_MAX_MS);
+      return { a: fc.a, b: fc.a, flow: fc.flow, alpha: 0, cell: CELL_SIZE[p], forecastLeadMs };
+    }
     const { i, alpha } = locate(fr, t);
     const am = fr[i]!, bm = fr[i + 1]!;
     const a = ps.decoded.get(am), b = ps.decoded.get(bm), f = ps.flows.get(am);
@@ -352,7 +371,7 @@ export class FrameStore extends EventTarget {
     const ps: ProductState = {
       p, pool: [], coveredFrom: Infinity, days: new Map(), earliest: null,
       decoded: new Map(), loading: new Set(), failed: new Set(), flows: new Map(), flowFailed: new Set(),
-      framesCache: null,
+      framesCache: null, forecast: null,
     };
     this.products.set(p, ps);
     return ps;
@@ -580,6 +599,29 @@ export class FrameStore extends EventTarget {
       }),
     );
   }
+
+  /**
+   * The nowcast base for the newest frame, from the flows of the last FORECAST_PAIRS adjacent pairs
+   * (newest first, stopping at the first missing one). Recomputed when the newest frame changes or more
+   * of those flows have arrived; null until the newest frame and the newest pair's flow are there.
+   */
+  private forecastOf(ps: ProductState, fr: number[]): ProductState["forecast"] {
+    const n = fr.length, newest = fr[n - 1]!;
+    const flows: FlowField[] = [], gaps: number[] = [];
+    for (let k = n - 2; k >= Math.max(0, n - 1 - FORECAST_PAIRS); k--) {
+      const f = ps.flows.get(fr[k]!);
+      if (!f || f.b !== fr[k + 1]) break;
+      flows.unshift(f.flow);
+      gaps.unshift(fr[k + 1]! - fr[k]!);
+    }
+    const a = ps.decoded.get(newest);
+    const c = ps.forecast;
+    if (c && c.newest === newest && (c.pairs >= flows.length || !a)) return c;
+    if (!a || flows.length === 0) return null;
+    ps.forecast = { newest, a, pairs: flows.length, flow: forecastFlow(flows, gaps) };
+    return ps.forecast;
+  }
+
 
   // ---- plumbing --------------------------------------------------------------------------------
 

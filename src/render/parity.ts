@@ -1,13 +1,14 @@
 /**
  * Dev-only GPU/CPU parity check for the shader's warp-and-blend (INTERP_GLSL) against
- * `sampleInterpolated`. Renders sampleInterpolated(p) for a grid of pixel positions p (fractional,
+ * `sampleInterpolated`, and its nowcast against `sampleForecast` (`leads`, with `flow` as the
+ * forecast flow in px/ms). Renders sampleInterpolated(p) for a grid of pixel positions p (fractional,
  * and running past every edge of the frame) into an RGBA32F target on an offscreen WebGL2 canvas,
  * reads it back and compares with the CPU. Needs EXT_color_buffer_float (Chrome has it).
  */
 import type { CellSize } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import type { FlowField } from "../motion/flow";
-import { sampleInterpolated } from "../motion/interpolate";
+import { sampleForecast, sampleInterpolated } from "../motion/interpolate";
 import { linkProgram, uploadFlow, uploadLevels } from "./radarLayer";
 import { INTERP_GLSL } from "./shaders";
 
@@ -25,22 +26,23 @@ ${INTERP_GLSL}
 uniform highp usampler2D u_a, u_b;
 uniform highp sampler2D u_flow;
 uniform ivec2 u_flowSize;
-uniform float u_alpha;
+uniform float u_alpha, u_lead;
 uniform int u_cell;
 uniform vec2 u_origin, u_step;
 out vec4 fragColor;
 void main() {
   vec2 p = u_origin + (gl_FragCoord.xy - 0.5) * u_step;
-  fragColor = vec4(sampleInterpolated(u_a, u_b, u_flow, u_flowSize, u_alpha, p, u_cell), 0.0, 0.0, 1.0);
+  fragColor = vec4(sampleSlot(u_a, u_b, u_flow, u_flowSize, u_alpha, u_lead, p, u_cell), 0.0, 0.0, 1.0);
 }
 `;
 
 export type ParityResult = {
-  cell: CellSize; alpha: number; maxAbsDiff: number; worst: { x: number; y: number; gpu: number; cpu: number };
+  cell: CellSize; alpha: number; leadMs: number; maxAbsDiff: number; worst: { x: number; y: number; gpu: number; cpu: number };
 };
 
 export function runParity(
   a: LevelField, b: LevelField, flow: FlowField, cell: CellSize, alphas = [0, 0.25, 0.5, 0.75, 1], N = 256,
+  leads: number[] = [],
 ): ParityResult[] {
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = N;
@@ -91,8 +93,10 @@ export function runParity(
 
   const out = new Float32Array(N * N * 4);
   const results: ParityResult[] = [];
-  for (const alpha of alphas) {
+  const cases = [...alphas.map((alpha) => ({ alpha, leadMs: 0 })), ...leads.map((leadMs) => ({ alpha: 0, leadMs }))];
+  for (const { alpha, leadMs } of cases) {
     gl.uniform1f(U("u_alpha"), alpha);
+    gl.uniform1f(U("u_lead"), leadMs);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.readPixels(0, 0, N, N, gl.RGBA, gl.FLOAT, out);
     let maxAbsDiff = 0;
@@ -101,11 +105,11 @@ export function runParity(
       for (let c = 0; c < N; c++) {
         const x = origin + c * step, y = origin + r * step;
         const gpu = out[(r * N + c) * 4]!;
-        const cpu = sampleInterpolated(a, b, flow, alpha, x, y, cell);
+        const cpu = leadMs > 0 ? sampleForecast(a, flow, leadMs, x, y, cell) : sampleInterpolated(a, b, flow, alpha, x, y, cell);
         const d = Math.abs(gpu - cpu);
         if (d > maxAbsDiff) { maxAbsDiff = d; worst = { x, y, gpu, cpu }; }
       }
-    results.push({ cell, alpha, maxAbsDiff, worst });
+    results.push({ cell, alpha, leadMs, maxAbsDiff, worst });
   }
   gl.getExtension("WEBGL_lose_context")?.loseContext();
   return results;

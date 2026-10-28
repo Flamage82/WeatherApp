@@ -4,12 +4,13 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // MapLibre finds its worker relative to its own module URL, which Vite's dep pre-bundling moves;
 // point it at the (self-contained) worker file explicitly. Works in dev and in the build.
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
-import { HOME } from "../../shared/config";
+import { HOME, NOWCAST_MAX_MS, RADARS } from "../../shared/config";
 import { decodeFrame } from "../../shared/decodeFrame";
 import { Clock } from "../controls/Clock";
 import { Legend } from "../controls/Legend";
 import { stepDetent } from "../controls/leverMath";
 import { PlayButton } from "../controls/PlayButton";
+import { rainHint } from "../controls/rainHint";
 import { SpeedLever } from "../controls/SpeedLever";
 import { StatusBar } from "../controls/StatusBar";
 import { useKeyboard } from "../controls/useKeyboard";
@@ -19,8 +20,9 @@ import { createFlowClient } from "../data/flowClient";
 import { FrameStore } from "../data/frameStore";
 import type { RadarLayer } from "../render/radarLayer";
 import { Tape } from "../tape/Tape";
-import { DEFAULT_SPAN_MS } from "../tape/tapeMath";
-import { loopWindow, stepPlayback, type PlayState } from "../time/timeline";
+import { buildHomeForecast } from "../tape/homeSeries";
+import { DEFAULT_SPAN_MS, SERIES_STEP_MS } from "../tape/tapeMath";
+import { stepPlayback, type PlayState } from "../time/timeline";
 import { RadarView } from "./radarView";
 
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
@@ -35,7 +37,7 @@ const EXTEND_MARGIN_MS = 20 * 60_000;
 const EXTEND_STEP_MS = 60 * 60_000;
 /** `ensureAround` is throttled to this while the playhead moves. */
 const ENSURE_THROTTLE_MS = 500;
-/** A playhead this close to the newest frame is live: it follows new frames (spec §6.4). */
+/** A playhead this close to the newest frame (either side) is live: it follows new frames (spec §6.4). */
 const LIVE_MS = 30_000;
 
 // Spec §7.1: dark by default; light only when the system explicitly asks for it.
@@ -67,6 +69,8 @@ type Ui = {
   radar: RadarName | null;
   status: FrameStore["status"];
   newestMs: number | null;
+  /** The "rain at home" line from the nowcast (`rainHint`). */
+  hint: string | null;
 };
 
 export function RadarScreen() {
@@ -78,9 +82,11 @@ export function RadarScreen() {
   const [spanMs, setSpanMs] = useState(DEFAULT_SPAN_MS);
   const spanRef = useRef(spanMs);
   spanRef.current = spanMs;
-  // Playback: `play.t` is the playhead while playing; `win` is the loop window (spec §6.4).
-  const play = useRef<PlayState>({ t: 0, speed: 0, lastSpeed: 1, holdMs: 0 });
-  const win = useRef({ start: 0, end: 0 });
+  // Playback: `play.t` is the playhead while playing. It runs from the loaded start to the nowcast's end,
+  // stopping at either end and where it crosses the newest frame, unless the user is driving the tape
+  // or holding the lever (`manual`).
+  const play = useRef<PlayState>({ t: 0, speed: 0, lastSpeed: 1 });
+  const manual = useRef({ tape: false, lever: false });
   const [speed, setSpeedUi] = useState(0);
   const [now, setNow] = useState(Date.now);
 
@@ -117,18 +123,25 @@ export function RadarScreen() {
     setStore(store);
 
     function publish() {
-      setUi({ t: view.time(), live: view.isLive(), radar: store.radar, status: store.status, newestMs: store.newestMs });
+      // The nowcast at home from the newest frame, whatever the playhead. A nowcast not ready yet (a new
+      // frame whose flow is still computing) keeps the last line.
+      const p = store.radar ? RADARS[store.radar].tapeProduct : null;
+      const geom = p ? store.geometry(p) : null;
+      const fc = p && geom ? buildHomeForecast(store, p, geom) : null;
+      setUi((u) => ({
+        t: view.time(), live: view.isLive(), radar: store.radar, status: store.status, newestMs: store.newestMs,
+        hint: fc ? rainHint(fc.values, SERIES_STEP_MS) : (u?.hint ?? null),
+      }));
     }
-    // While playing, new frames extend the loop window if it ended at the newest frame, and a playhead
-    // at the newest frame follows them. (Paused, a live view follows by itself.)
+    // While playing, a playhead at the newest frame follows new frames (paused, a live view follows by
+    // itself). One inside the nowcast keeps its time, clamped to the nowcast's end.
     let newest = store.loadedWindow().end;
     const onChange = () => {
       const end = store.loadedWindow().end;
       const p = play.current;
-      if (end > newest && p.speed !== 0) {
-        if (win.current.end >= newest) win.current = { ...win.current, end };
-        if (Math.abs(p.t - newest) <= LIVE_MS) play.current = { ...p, t: end };
-      }
+      if (end > newest && p.speed !== 0 && Math.abs(p.t - newest) <= LIVE_MS) play.current = { ...p, t: end };
+      if (play.current.t > end + NOWCAST_MAX_MS) play.current = { ...play.current, t: end + NOWCAST_MAX_MS };
+      if (!view.isLive() && view.time() > end + NOWCAST_MAX_MS) view.setTime(end + NOWCAST_MAX_MS);
       newest = end;
       view.onStoreChange();
       publish();
@@ -171,7 +184,7 @@ export function RadarScreen() {
     const store = storeRef.current, view = viewRef.current;
     if (!store || !view) return;
     const w = store.loadedWindow();
-    const live = v >= w.end - LIVE_MS;
+    const live = Math.abs(v - w.end) <= LIVE_MS;
     view.setTime(live ? null : v);
     if (live) {
       // Live: the decode window must follow new frames, so unpin the focus (never throttled).
@@ -189,32 +202,22 @@ export function RadarScreen() {
     setUi((u) => (u ? { ...u, t: view.time(), live } : u));
   }, []);
 
-  /** The loop window around `t` (spec §6.4), with its stamps requested if it starts before what's loaded. */
-  const loopAround = (t: number) => {
-    const store = storeRef.current!;
-    const w = store.loadedWindow();
-    win.current = loopWindow(t, w.end);
-    if (win.current.start < w.start) store.extendBack(win.current.start);
-  };
-
-  // A user move (tape or keys; already clamped to the loaded window). While playing, playback carries
-  // on from there in a new loop window.
+  // A user move (tape or keys; already clamped to the loaded start .. the nowcast's end). While playing,
+  // playback carries on from there.
   const onScrub = (v: number) => {
     applyTime(v);
-    if (play.current.speed !== 0) {
-      play.current = { ...play.current, t: v, holdMs: 0 };
-      loopAround(v);
-    }
+    if (play.current.speed !== 0) play.current = { ...play.current, t: v };
   };
 
   const setSpeed = (s: number) => {
-    const view = viewRef.current;
-    if (!view) return;
+    const view = viewRef.current, store = storeRef.current;
+    if (!view || !store) return;
     const p = play.current;
     if (p.speed === 0 && s !== 0) {
-      // Play pressed: the loop window is fixed around the playhead.
-      play.current = { ...p, t: view.time(), holdMs: 0 };
-      loopAround(view.time());
+      // Play pressed: start from the playhead; at live, exactly at the newest frame, so that playing
+      // forward runs on into the nowcast instead of stopping at once.
+      const end = store.loadedWindow().end, t = view.time();
+      play.current = { ...p, t: Math.abs(t - end) <= LIVE_MS ? end : t };
     }
     play.current = { ...play.current, speed: s, lastSpeed: s !== 0 ? s : p.lastSpeed };
     setSpeedUi(s);
@@ -228,9 +231,13 @@ export function RadarScreen() {
     const tick = (now: number) => {
       const dt = Math.max(0, now - last);
       last = now;
-      play.current = stepPlayback(play.current, dt, win.current);
+      const store = storeRef.current;
+      if (!store) return;
+      const w = store.loadedWindow(), m = manual.current;
+      play.current = stepPlayback(play.current, dt, { start: w.start, end: w.end + NOWCAST_MAX_MS, now: w.end }, m.tape || m.lever);
       applyTime(play.current.t);
-      raf = requestAnimationFrame(tick);
+      if (play.current.speed === 0) setSpeedUi(0); // stopped at an end, or at now
+      else raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
@@ -242,7 +249,7 @@ export function RadarScreen() {
       const store = storeRef.current, view = viewRef.current;
       if (!store || !view) return;
       const { start, end } = store.loadedWindow();
-      onScrub(Math.min(Math.max(view.time() + d, start), end));
+      onScrub(Math.min(Math.max(view.time() + d, start), end + NOWCAST_MAX_MS));
     },
     stepSpeed: (dir) => setSpeed(stepDetent(play.current.speed, dir)),
   });
@@ -257,7 +264,7 @@ export function RadarScreen() {
   return (
     <div style={{ position: "fixed", inset: 0 }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
-      {ui && <Clock t={ui.t} now={now} />}
+      {store && ui && <Clock t={ui.t} now={now} newestMs={store.loadedWindow().end} hint={ui.hint} />}
       {/* The lever, centred in the space between the clock and the controls (at most 240 px tall). */}
       <div
         style={{
@@ -265,7 +272,7 @@ export function RadarScreen() {
           bottom: "calc(200px + env(safe-area-inset-bottom))", maxHeight: 240, margin: "auto 0",
         }}
       >
-        <SpeedLever speed={speed} onChange={setSpeed} />
+        <SpeedLever speed={speed} onChange={setSpeed} onHold={(h) => { manual.current.lever = h; }} />
       </div>
       {store && ui && (
         <div
@@ -277,8 +284,16 @@ export function RadarScreen() {
         >
           {/* Positioned, so the open legend sits above the tape. */}
           <div style={{ position: "relative", maxWidth: 720, margin: "0 auto", display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ borderRadius: 8, overflow: "hidden", background: "rgba(0,0,0,0.6)" }}>
-              <Tape store={store} t={ui.t} spanMs={spanMs} onScrub={onScrub} onSpanChange={setSpanMs} />
+            <div
+              style={{
+                borderRadius: 8, overflow: "hidden", background: "rgba(0,0,0,0.6)",
+                border: "1px solid var(--control-border)", boxShadow: "var(--control-shadow)",
+              }}
+            >
+              <Tape
+                store={store} t={ui.t} spanMs={spanMs} onScrub={onScrub} onSpanChange={setSpanMs}
+                onGesture={(a) => { manual.current.tape = a; }}
+              />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center" }}>
               <div style={{ justifySelf: "start" }}><Legend /></div>

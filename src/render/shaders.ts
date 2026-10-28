@@ -1,8 +1,11 @@
+import { NOWCAST_MAX_MS } from "../../shared/config";
+import { FORECAST_MIN_OPACITY } from "../motion/interpolate";
+
 /**
  * GLSL ES 3.00 sources for the radar layer.
  *
- * INTERP_GLSL is a line-for-line port of `src/motion/interpolate.ts` `sampleInterpolated` and
- * `src/motion/flow.ts` `flowAt`. Both bilinear lookups are done by hand with `texelFetch`, not
+ * INTERP_GLSL is a line-for-line port of `src/motion/interpolate.ts` `sampleInterpolated`,
+ * `sampleForecast` and `forecastOpacity`, and `src/motion/flow.ts` `flowAt`. Both bilinear lookups are done by hand with `texelFetch`, not
  * hardware filtering:
  *  - level textures (R8UI): out-of-bounds taps read 0 exactly, which WebGL2 can't express with
  *    wrap modes (no clamp-to-border), and the tap positions match the CPU (value at integer coords);
@@ -60,6 +63,22 @@ float sampleInterpolated(highp usampler2D a, highp usampler2D b, highp sampler2D
   float wb = bilinearLevel(b, p + (1.0 - alpha) * F, k);
   return min((1.0 - alpha) * wa + alpha * wb, max(wa, wb));
 }
+
+// Nowcast (see interpolate.ts sampleForecast): V = flowAt(p) in px/ms; result = A(p - leadMs*V).
+float sampleForecast(highp usampler2D a, highp sampler2D v, ivec2 vsize, float leadMs, vec2 p, int k) {
+  return bilinearLevel(a, p - leadMs * flowAt(v, vsize, p), k);
+}
+
+// interpolate.ts forecastOpacity: 1 at lead 0, fading linearly to FORECAST_MIN_OPACITY at NOWCAST_MAX_MS.
+float forecastOpacity(float leadMs) {
+  return 1.0 - ${(1 - FORECAST_MIN_OPACITY).toFixed(4)} * clamp(leadMs / ${NOWCAST_MAX_MS.toFixed(1)}, 0.0, 1.0);
+}
+
+// A slot's level: the nowcast when leadMs > 0, else the A/B interpolation.
+float sampleSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize,
+                 float alpha, float leadMs, vec2 p, int k) {
+  return leadMs > 0.0 ? sampleForecast(a, fl, fsize, leadMs, p, k) : sampleInterpolated(a, b, fl, fsize, alpha, p, k);
+}
 `;
 
 export const VERTEX_SHADER = /* glsl */ `#version 300 es
@@ -76,7 +95,8 @@ void main() {
 /**
  * Two "slots" so one pass can crossfade between two ranges (slot 1 is skipped while u_mix == 0).
  * Per slot: gnomonic tangent point (radians), image extent in tangent-plane units, the A/B level
- * textures, the A->B flow texture and the blend position alpha.
+ * textures, the A->B flow texture and the blend position alpha; or, with u_lead > 0, the nowcast:
+ * A = the newest frame, the flow texture = the forecast flow (px/ms), drawn faded with lead time.
  */
 export const FRAGMENT_SHADER = /* glsl */ `#version 300 es
 precision highp float;
@@ -92,6 +112,7 @@ uniform highp usampler2D u_a0, u_b0, u_a1, u_b1;
 uniform highp sampler2D u_flow0, u_flow1;
 uniform ivec2 u_flowSize0, u_flowSize1;
 uniform float u_alpha0, u_alpha1;
+uniform float u_lead0, u_lead1;      // nowcast lead (ms) past A; 0 = interpolate A/B
 uniform int u_cell0, u_cell1;        // native cell size k (CELL_SIZE[product])
 uniform vec2 u_centre0, u_centre1;   // (lat0, lon0) radians
 uniform vec4 u_extent0, u_extent1;   // (xMin, xMax, yMin, yMax)
@@ -129,16 +150,16 @@ void main() {
     vec2 uv = gnomonicUV(lonLat, u_centre0, u_extent0);
     if (inside(uv)) {
       hit = true;
-      float l = sampleInterpolated(u_a0, u_b0, u_flow0, u_flowSize0, u_alpha0, uv * 512.0 - 0.5, u_cell0);
-      col += (1.0 - u_mix) * ramp(l);
+      float l = sampleSlot(u_a0, u_b0, u_flow0, u_flowSize0, u_alpha0, u_lead0, uv * 512.0 - 0.5, u_cell0);
+      col += (1.0 - u_mix) * forecastOpacity(u_lead0) * ramp(l);
     }
   }
   if (u_mix > 0.0) {
     vec2 uv = gnomonicUV(lonLat, u_centre1, u_extent1);
     if (inside(uv)) {
       hit = true;
-      float l = sampleInterpolated(u_a1, u_b1, u_flow1, u_flowSize1, u_alpha1, uv * 512.0 - 0.5, u_cell1);
-      col += u_mix * ramp(l);
+      float l = sampleSlot(u_a1, u_b1, u_flow1, u_flowSize1, u_alpha1, u_lead1, uv * 512.0 - 0.5, u_cell1);
+      col += u_mix * forecastOpacity(u_lead1) * ramp(l);
     }
   }
   if (!hit || col.a <= 0.0) discard;

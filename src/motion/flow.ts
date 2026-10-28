@@ -1,7 +1,10 @@
 import type { LevelField } from "../../shared/decodeFrame";
 
-/** (dx,dy) pairs in full-res px (A -> B) on a gw x gh grid spanning the frame. */
-export type FlowField = { gw: number; gh: number; data: Float32Array };
+/**
+ * (dx,dy) pairs in full-res px (A -> B) on a gw x gh grid spanning the frame. `valid` (computeFlow
+ * only) marks the cells block matching measured, i.e. the ones with rain; the rest are filled in.
+ */
+export type FlowField = { gw: number; gh: number; data: Float32Array; valid?: Uint8Array };
 
 export const ZERO_FLOW: FlowField = { gw: 1, gh: 1, data: new Float32Array(2) };
 
@@ -73,7 +76,7 @@ export function computeFlow(a: LevelField, b: LevelField): FlowField {
     }
 
   const out = new Float32Array(n * 2);
-  if (!anyValid) return { gw: GRID, gh: GRID, data: out };
+  if (!anyValid) return { gw: GRID, gh: GRID, data: out, valid };
 
   // Fill invalid cells: 1/d^2 weighted mean of valid vectors within FILL_RADIUS cells.
   const fx = new Float32Array(vx), fy = new Float32Array(vy);
@@ -116,6 +119,52 @@ export function computeFlow(a: LevelField, b: LevelField): FlowField {
   for (let k = 0; k < n; k++) {
     out[2 * k] = gx[k]! * DS;
     out[2 * k + 1] = gy[k]! * DS;
+  }
+  return { gw: GRID, gh: GRID, data: out, valid };
+}
+
+/** Pair flows averaged by `forecastFlow`: the newest this many. */
+export const FORECAST_PAIRS = 3;
+
+/**
+ * The nowcast motion field, in px per ms: the mean of the last FORECAST_PAIRS pair flows (each divided
+ * by its pair's gap) over the cells each one measured, then every unmeasured cell filled by 1/d^2
+ * weighting from all measured cells, with no radius limit (far from rain this tends to the domain
+ * mean), so rain keeps moving past its current edge. Flows without a `valid` mask (zero flows for big
+ * gaps or errors) count as no data. No motion anywhere gives zero: the rain is drawn stationary.
+ */
+export function forecastFlow(flows: FlowField[], gapsMs: number[]): FlowField {
+  const n = GRID * GRID;
+  const sx = new Float32Array(n), sy = new Float32Array(n), cnt = new Uint8Array(n);
+  for (let q = Math.max(0, flows.length - FORECAST_PAIRS); q < flows.length; q++) {
+    const f = flows[q]!, gap = gapsMs[q]!;
+    if (!f.valid || f.gw !== GRID || f.gh !== GRID || !(gap > 0)) continue;
+    for (let k = 0; k < n; k++) {
+      if (!f.valid[k]) continue;
+      sx[k] = sx[k]! + f.data[2 * k]! / gap;
+      sy[k] = sy[k]! + f.data[2 * k + 1]! / gap;
+      cnt[k] = cnt[k]! + 1;
+    }
+  }
+  const known: number[] = [];
+  for (let k = 0; k < n; k++) if (cnt[k]) known.push(k);
+  const out = new Float32Array(n * 2);
+  for (const k of known) {
+    out[2 * k] = sx[k]! / cnt[k]!;
+    out[2 * k + 1] = sy[k]! / cnt[k]!;
+  }
+  if (known.length === 0) return { gw: GRID, gh: GRID, data: out };
+  for (let k = 0; k < n; k++) {
+    if (cnt[k]) continue;
+    const i = k % GRID, j = (k - i) / GRID;
+    let sw = 0, wx = 0, wy = 0;
+    for (const m of known) {
+      const di = (m % GRID) - i, dj = Math.floor(m / GRID) - j;
+      const w = 1 / (di * di + dj * dj);
+      sw += w; wx += w * out[2 * m]!; wy += w * out[2 * m + 1]!;
+    }
+    out[2 * k] = wx / sw;
+    out[2 * k + 1] = wy / sw;
   }
   return { gw: GRID, gh: GRID, data: out };
 }
