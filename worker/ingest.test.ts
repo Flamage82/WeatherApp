@@ -76,8 +76,14 @@ function fakeFtp(listing: Partial<Record<ProductId, string[]>>, opts: { failRetr
 }
 type F = ReturnType<typeof fakeFtp>;
 
-const seedState = (b: B, partial: Partial<IngestState> = {}) =>
+const g504 = parseMapFile(m504);
+/** State plus, like a real run would have left, the frame stored at each product's newest stamp. */
+const seedState = (b: B, partial: Partial<IngestState> = {}) => {
   b.store.set("state/marburg.json", JSON.stringify({ newest: {}, lastOk: {}, lastError: {}, ...partial }));
+  for (const [p, s] of Object.entries(partial.newest ?? {})) b.store.set(`frames/${p}/${s}.png`, new Uint8Array([1]));
+};
+const seedGeo = (b: B, fetchedAt = new Date(NOW - HOUR).toISOString()) =>
+  b.store.set("meta/IDR504.json", JSON.stringify({ ...g504, fetchedAt }));
 const state = (b: B) => JSON.parse(b.store.get("state/marburg.json") as string) as IngestState;
 const allNewest = (s: string) => Object.fromEntries(MARBURG.map((p) => [p, s]));
 const freshMeta = () => new Date(NOW - HOUR).toISOString();
@@ -104,7 +110,6 @@ describe("runIngest", () => {
     });
     expect(putKeys(b)).toEqual([`frames/IDR503/${S2}.png`, "state/marburg.json"]);
     expect(b.get.mock.calls.map((c) => c[0])).toEqual(["state/marburg.json"]);
-    expect(b.list).not.toHaveBeenCalled();
     expect(state(b).newest.IDR503).toBe(S2);
     expect(state(b).lastOk.IDR503).toBe(new Date(NOW).toISOString());
     expect(state(b).lastOk.IDR501).toBeUndefined();
@@ -176,6 +181,7 @@ describe("runIngest", () => {
   it("one product failing does not stop the others", async () => {
     const b = fakeBucket();
     seedState(b, { newest: allNewest(S1) });
+    seedGeo(b);
     const f = fakeFtp(
       { IDR503: [S1, S2], IDR504: [S1, S2] },
       { failRetrieve: (p) => p.includes("IDR504.T.") },
@@ -188,23 +194,17 @@ describe("runIngest", () => {
     expect(state(b).lastError.IDR504).toContain("boom");
   });
 
-  it("caps downloads per product, newest first, and a backlog continues without repeats", async () => {
+  it("downloads every missing frame in the listing (no cap), newest first, across products", async () => {
     const b = fakeBucket();
     seedState(b, { newest: allNewest("202610270500") });
     const stamps = Array.from({ length: 7 }, (_, i) => `2026102705${String(10 + i * 5)}`);
-    const deps = { IDR501: stamps, IDR502: stamps };
-    const f = fakeFtp(deps);
+    const f = fakeFtp({ IDR501: stamps, IDR502: stamps });
     const r = await run(b, f);
-    expect(r.added.IDR501).toBe(2);
-    expect(r.added.IDR502).toBe(2);
-    expect(f.retrieve.mock.calls.filter((c) => String(c[0]).includes("IDR501")).map((c) => c[0])).toEqual([
-      frameFor("IDR501", stamps[6]!),
-      frameFor("IDR501", stamps[5]!),
-    ]);
-    expect(state(b).newest.IDR501).toBe("202610270500"); // backlog: not advanced
-    const f2 = fakeFtp(deps);
-    await run(b, f2, { maxDownloads: 10 });
-    expect(f2.retrieve.mock.calls.filter((c) => String(c[0]).includes("IDR501"))).toHaveLength(5);
+    expect(r.added.IDR501).toBe(7);
+    expect(r.added.IDR502).toBe(7);
+    expect(f.retrieve.mock.calls.filter((c) => String(c[0]).includes("IDR501")).map((c) => c[0])).toEqual(
+      [...stamps].reverse().map((s) => frameFor("IDR501", s)),
+    );
     expect(state(b).newest.IDR501).toBe(stamps[6]);
   });
 
@@ -256,15 +256,6 @@ describe("runIngest", () => {
     for (const p of MARBURG) expect(state(b).lastError[p]).toContain("421");
   });
 
-  it("without radarGlob each product is listed with its own glob", async () => {
-    const b = fakeBucket();
-    seedState(b, { newest: allNewest(S1) });
-    const f = fakeFtp({ IDR503: [S1, S2] });
-    await run(b, f, { radarGlob: undefined });
-    expect(f.list.mock.calls.map((c) => c[0])).toEqual(MARBURG.map((p) => `/anon/gen/radar/${p}.T.*.png`));
-    expect(f.retrieve).toHaveBeenCalledTimes(1);
-  });
-
   it("fetches meta when missing or older than 7 days, else skips; never when refreshMeta is false", async () => {
     const mapPath = "/anon/gen/radar_transparencies/coordinates/IDR503.map";
     const count = async (seed?: string, refreshMeta = true) => {
@@ -286,8 +277,7 @@ describe("runIngest", () => {
   });
 
   describe("home level on the tape product", () => {
-    const g504 = parseMapFile(m504);
-    const homePng = () => {
+      const homePng = () => {
       const { x, y } = homePixel(g504);
       const data = new Uint8Array(512 * 512);
       for (let py = 0; py < 512; py++) {
@@ -325,16 +315,48 @@ describe("runIngest", () => {
       expect(r.errors).toHaveLength(1);
     });
 
-    it("missing, unfetchable meta stores the frame without home and does not throw", async () => {
+    it("no geometry at all: tape frames are not put and newest does not advance, so the next run retries", async () => {
       const b = fakeBucket();
       seedState(b, { newest: allNewest(S1) });
       for (const p of MARBURG.filter((p) => p !== "IDR504")) seedMeta(b, p);
       const f = fakeFtp({ IDR504: [S1, S2] }, { failRetrieve: (p) => p.endsWith(".map") });
       const r = await run(b, f, { refreshMeta: true });
-      expect(frameOpts(b, "IDR504")).toEqual({ httpMetadata: { contentType: "image/png" } });
-      expect(b.store.has(`frames/IDR504/${S2}.png`)).toBe(true);
-      expect(r.errors).toHaveLength(1);
+      expect(b.store.has(`frames/IDR504/${S2}.png`)).toBe(false);
+      expect(state(b).newest.IDR504).toBe(S1);
+      expect(state(b).lastError.IDR504).toBe("no geometry");
+      expect(r.errors).toHaveLength(2); // the failed map and the refused frames
     });
+
+    it("a failed map refetch falls back to the stale stored geometry, so frames still get their level", async () => {
+      const { b, f } = setup("IDR504", homePng());
+      seedGeo(b, new Date(NOW - 8 * 24 * HOUR).toISOString());
+      f.retrieve.mockImplementation(async (p: string) => {
+        if (p.endsWith(".map")) throw new Error("map down");
+        return homePng() as Uint8Array<ArrayBuffer>;
+      });
+      const r = await run(b, f, { refreshMeta: true });
+      expect(frameOpts(b, "IDR504")).toEqual({ httpMetadata: { contentType: "image/png" }, customMetadata: { home: "10" } });
+      expect(r.errors).toContain("IDR504: meta: map down");
+    });
+  });
+
+  it("a stamp that appears late (older than newest) is still fetched", async () => {
+    const b = fakeBucket();
+    seedState(b, { newest: allNewest(S3) });
+    const f = fakeFtp({ IDR503: [S1, S2, S3] }); // S1 and S2 never stored
+    await run(b, f);
+    expect(f.retrieve.mock.calls.map((c) => c[0])).toEqual([frameFor("IDR503", S2), frameFor("IDR503", S1)]);
+    expect(state(b).newest.IDR503).toBe(S3);
+  });
+
+  it("a 550 that is not 'No files found' is a real error, not an empty list", async () => {
+    const b = fakeBucket();
+    seedState(b, { newest: allNewest(S1) });
+    const f = fakeFtp({});
+    f.list.mockRejectedValueOnce(new Error("FTP NLST: 550 Permission denied"));
+    const r = await run(b, f);
+    expect(r.errors.length).toBeGreaterThan(0);
+    expect(state(b).lastError.IDR503).toContain("Permission denied");
   });
 
   it("meta failure does not block frames", async () => {

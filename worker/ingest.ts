@@ -22,29 +22,42 @@ export type IngestState = {
 
 const META_MAX_AGE_MS = 7 * 86_400_000;
 const MAP_DIR = "/anon/gen/radar_transparencies/coordinates";
-const DEFAULT_MAX_DOWNLOADS = 2;
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** A glob matching nothing may surface as an FTP 450/550 rather than an empty list. */
-const isNoFiles = (e: unknown) => /\b[45]50\b/.test(msg(e));
+/** BOM's FTP server answers a glob that matches nothing with "450/550 No files found" instead of an empty list. */
+const isNoFiles = (e: unknown) => /\b[45]50\b.*no files found/i.test(msg(e));
 
 /** Stored meta is the geometry plus `fetchedAt`; anything without corners is treated as no geometry. */
 const asGeometry = (m: Partial<RadarGeometry> | null): RadarGeometry | null => (m?.corners ? (m as RadarGeometry) : null);
 
-/** Refreshes `meta/{product}.json` when missing or stale and returns the geometry, if there is one. */
-async function fetchMeta(ftp: FtpSource, bucket: BucketLike, product: ProductId, nowMs: number): Promise<RadarGeometry | null> {
+/**
+ * Refreshes `meta/{product}.json` when missing or stale and returns the geometry, if there is one.
+ * If refetching the `.map` fails, the stale stored geometry is returned together with the error.
+ */
+async function fetchMeta(
+  ftp: FtpSource,
+  bucket: BucketLike,
+  product: ProductId,
+  nowMs: number,
+): Promise<{ geometry: RadarGeometry | null; error: string | null }> {
   const key = `meta/${product}.json`;
   const existing = await bucket.get(key);
+  let stale: RadarGeometry | null = null;
   if (existing) {
     const meta = (await existing.json()) as Partial<RadarGeometry> & { fetchedAt?: string };
+    stale = asGeometry(meta);
     const age = nowMs - Date.parse(meta.fetchedAt ?? "");
-    if (age >= 0 && age < META_MAX_AGE_MS) return asGeometry(meta);
+    if (age >= 0 && age < META_MAX_AGE_MS) return { geometry: stale, error: null };
   }
-  const bytes = await ftp.retrieve(`${MAP_DIR}/${product}.map`);
-  const geometry = parseMapFile(new TextDecoder().decode(bytes));
-  await bucket.put(key, JSON.stringify({ ...geometry, fetchedAt: new Date(nowMs).toISOString() }));
-  return geometry;
+  try {
+    const bytes = await ftp.retrieve(`${MAP_DIR}/${product}.map`);
+    const geometry = parseMapFile(new TextDecoder().decode(bytes));
+    await bucket.put(key, JSON.stringify({ ...geometry, fetchedAt: new Date(nowMs).toISOString() }));
+    return { geometry, error: null };
+  } catch (e) {
+    return { geometry: stale, error: msg(e) };
+  }
 }
 
 /** Stamps already stored in R2 after `afterStamp` (a plain key listing, no JSON). */
@@ -61,28 +74,27 @@ async function storedAfter(bucket: BucketLike, product: ProductId, afterStamp: s
 }
 
 /**
- * `radarGlob`, when given, is listed once for all products; otherwise each product is
- * listed with its own glob. There are no per-product manifests: `/api/manifest` is built
- * from an R2 list. `state/{radar}.json` is read once and written once, only if changed.
+ * `radarGlob` is listed once for all of the radar's products and every missing in-window frame is
+ * downloaded (no caps). A frame counts as missing when its stamp is listed, within 24 h, and has no R2
+ * key (one key listing per product with in-window stamps), so a stamp that shows up late is still fetched.
+ * There are no per-product manifests: `/api/manifest` is built from an R2 list.
+ * `state/{radar}.json` is read once and written once, only if changed.
  *
- * State advancement rule: `newest[product]` only ever moves to the newest listed in-window stamp,
- * and only when every in-window stamp newer than the old `newest` is stored afterwards, i.e. it was
- * already there or was downloaded and put in this run. A listing error, a failed download or put,
- * or a backlog left by the per-product cap leaves it unchanged, so the next run retries. Stamps
- * above `newest` that did get stored are skipped on retry via one R2 key listing.
+ * `newest[product]` (informational) only moves to the newest listed in-window stamp, and only when every
+ * missing in-window frame was stored in this run. A listing error, a failed download or put, or a tape
+ * product with no geometry (its frames must carry the home level) leaves it unchanged and stores nothing,
+ * so the next run retries.
  */
 export async function runIngest(deps: {
   ftp: FtpSource;
   bucket: BucketLike;
   nowMs: number;
   radar: "marburg" | "stapylton";
-  radarGlob?: string;
-  maxDownloads?: number; // per product
+  radarGlob: string;
   refreshMeta?: boolean;
 }): Promise<IngestReport> {
   const { ftp, bucket, nowMs, radar } = deps;
   const products = RADARS[radar].products;
-  const perProductCap = deps.maxDownloads ?? DEFAULT_MAX_DOWNLOADS;
   const refreshMeta = deps.refreshMeta ?? true;
   const nowIso = new Date(nowMs).toISOString();
   const cutoff = nowMs - MANIFEST_SPAN_MS;
@@ -105,63 +117,46 @@ export async function runIngest(deps: {
   }
   let stateChanged = false;
 
-  let combined: Map<ProductId, string[]> | null = null;
+  let combined = new Map<ProductId, string[]>();
   let combinedError: string | null = null;
-  const list = async (glob: string) => {
-    try {
-      return parseListing(await ftp.list(glob));
-    } catch (e) {
-      if (isNoFiles(e)) return new Map<ProductId, string[]>();
-      throw e;
-    }
-  };
-  if (deps.radarGlob) {
-    try {
-      combined = await list(deps.radarGlob);
-    } catch (e) {
-      combinedError = msg(e);
-    }
+  try {
+    combined = parseListing(await ftp.list(deps.radarGlob));
+  } catch (e) {
+    if (!isNoFiles(e)) combinedError = msg(e);
   }
 
   for (const product of products) {
-    let listed: string[] = [];
+    const listed = combined.get(product) ?? [];
     let frameError: string | null = combinedError;
     let metaError: string | null = null;
-    if (!frameError) {
-      try {
-        listed = (combined ?? (await list(`/anon/gen/radar/${product}.T.*.png`))).get(product) ?? [];
-      } catch (e) {
-        frameError = msg(e);
-      }
-    }
 
     const known = state.newest[product];
-    const listedNewest = listed[listed.length - 1];
+    const inWindow = listed.filter((s) => stampToMs(s) >= cutoff);
+    const listedNewest = inWindow[inWindow.length - 1];
     let fetched = 0;
 
     // The tape product's frames carry the rain level at home, which needs the geometry before the first put.
     const isTape = product === RADARS[radar].tapeProduct;
     let geometry: RadarGeometry | null = null;
-    if (isTape) {
+    if (isTape && refreshMeta) {
       try {
-        if (refreshMeta) geometry = await fetchMeta(ftp, bucket, product, nowMs);
-        else if (listedNewest && (!known || listedNewest > known)) {
-          geometry = asGeometry((await (await bucket.get(`meta/${product}.json`))?.json()) as Partial<RadarGeometry> | null);
-        }
+        const m = await fetchMeta(ftp, bucket, product, nowMs);
+        geometry = m.geometry;
+        if (m.error) metaError = `meta: ${m.error}`;
       } catch (e) {
         metaError = `meta: ${msg(e)}`;
       }
     }
 
-    if (!frameError && listedNewest && (!known || listedNewest > known)) {
+    if (!frameError && listedNewest) {
       try {
-        const todo = listed.filter((s) => (!known || s > known) && stampToMs(s) >= cutoff).reverse(); // newest first
-        let missing = todo;
-        if (todo.length > 1) {
-          const stored = await storedAfter(bucket, product, known && known > cutoffStamp ? known : cutoffStamp);
-          missing = todo.filter((s) => !stored.has(s));
+        const stored = await storedAfter(bucket, product, msToStamp(cutoff - 60_000));
+        const missing = inWindow.filter((s) => !stored.has(s)).reverse(); // newest first
+        if (isTape && missing.length > 0 && !geometry) {
+          geometry = asGeometry((await (await bucket.get(`meta/${product}.json`))?.json()) as Partial<RadarGeometry> | null);
+          if (!geometry) throw new Error("no geometry");
         }
-        for (const stamp of missing.slice(0, perProductCap)) {
+        for (const stamp of missing) {
           const bytes = await ftp.retrieve(`/anon/gen/radar/${product}.T.${stamp}.png`);
           let customMetadata: Record<string, string> | undefined;
           if (geometry) {
@@ -177,8 +172,8 @@ export async function runIngest(deps: {
           });
           fetched++;
         }
-        if (fetched === missing.length && todo.length > 0) {
-          state.newest[product] = todo[0];
+        if (fetched === missing.length && (!known || listedNewest > known)) {
+          state.newest[product] = listedNewest;
           stateChanged = true;
         }
       } catch (e) {
@@ -189,7 +184,8 @@ export async function runIngest(deps: {
 
     if (refreshMeta && !isTape) {
       try {
-        await fetchMeta(ftp, bucket, product, nowMs);
+        const m = await fetchMeta(ftp, bucket, product, nowMs);
+        if (m.error) metaError = `meta: ${m.error}`;
       } catch (e) {
         metaError = `meta: ${msg(e)}`;
       }

@@ -1,4 +1,3 @@
-import { RADARS, type ProductId } from "../shared/config";
 import { handleApi } from "./api";
 import { openBomFtp } from "./ftp";
 import { runIngest } from "./ingest";
@@ -7,20 +6,42 @@ export interface Env {
   BUCKET: R2Bucket;
 }
 
-/** Even UTC minutes poll Marburg, odd minutes Mt Stapylton (halves per-invocation CPU). */
-export function productsForMinute(scheduledTimeMs: number): ProductId[] {
-  const minute = Math.floor(scheduledTimeMs / 60_000);
-  return minute % 2 === 0 ? RADARS.marburg.products : RADARS.stapylton.products;
-}
+type Radar = "marburg" | "stapylton";
 
 /** One NLST for all four products of a radar (verified against ftp.bom.gov.au). */
-export function radarGlob(radar: "marburg" | "stapylton"): string {
+export function radarGlob(radar: Radar): string {
   return `/anon/gen/radar/${radar === "marburg" ? "IDR50" : "IDR66"}[1-4].T.*.png`;
 }
 
-/** True in UTC minutes 0 and 1, so each radar (even/odd minute) checks its map files hourly. */
+/** True in UTC minute 0 of each hour: both radars check their map files hourly. */
 export function shouldRefreshMeta(scheduledTimeMs: number): boolean {
-  return Math.floor(scheduledTimeMs / 60_000) % 60 < 2;
+  return Math.floor(scheduledTimeMs / 60_000) % 60 === 0;
+}
+
+/** One radar's ingest on its own FTP connection. Never throws, so one radar failing can't stop the other. */
+async function ingestRadar(radar: Radar, bucket: R2Bucket, scheduledTime: number): Promise<string> {
+  let ftp;
+  try {
+    ftp = await openBomFtp();
+  } catch (e) {
+    return `${radar} ftp open failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  try {
+    const r = await runIngest({
+      ftp,
+      bucket,
+      nowMs: Date.now(),
+      radar,
+      radarGlob: radarGlob(radar),
+      refreshMeta: shouldRefreshMeta(scheduledTime),
+    });
+    const added = Object.values(r.added).reduce((n, c) => n + c, 0);
+    return `${radar} +${added}${r.errors.length ? " " + r.errors.join("; ") : ""}`;
+  } catch (e) {
+    return `${radar} ingest failed: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    await ftp.close().catch(() => {});
+  }
 }
 
 export default {
@@ -33,35 +54,12 @@ export default {
     });
   },
 
+  /** Every minute: both radars in parallel, one log line. */
   async scheduled(event, env, ctx): Promise<void> {
-    const products = productsForMinute(event.scheduledTime);
     ctx.waitUntil(
-      (async () => {
-        let ftp;
-        try {
-          ftp = await openBomFtp();
-        } catch (e) {
-          console.error(`ftp open failed: ${e instanceof Error ? e.message : String(e)}`);
-          return;
-        }
-        try {
-          const radar = products === RADARS.marburg.products ? "marburg" : "stapylton";
-          const r = await runIngest({
-            ftp,
-            bucket: env.BUCKET,
-            nowMs: Date.now(),
-            radar,
-            radarGlob: radarGlob(radar),
-            refreshMeta: shouldRefreshMeta(event.scheduledTime),
-          });
-          const added = products.reduce((n, p) => n + r.added[p], 0);
-          console.log(`${products[0]} +${added}${r.errors.length ? " " + r.errors.join("; ") : ""}`);
-        } catch (e) {
-          console.error(`ingest failed: ${e instanceof Error ? e.message : String(e)}`);
-        } finally {
-          await ftp.close().catch(() => {});
-        }
-      })(),
+      Promise.all((["marburg", "stapylton"] as const).map((radar) => ingestRadar(radar, env.BUCKET, event.scheduledTime))).then(
+        (lines) => console.log(lines.join(" | ")),
+      ),
     );
   },
 } satisfies ExportedHandler<Env>;

@@ -27,7 +27,7 @@ const FRAME_MS = 1000 / 60;
 const BRISBANE_OFFSET_MS = 36_000_000;
 const DAY_MS = 86_400_000;
 /** Cached series days refetched when a new frame arrives: the newest frame's day, and the day before it for this long. */
-const DAY_SETTLE_MS = 7_200_000;
+const DAY_SETTLE_MS = 10_800_000;
 /** A failed series day is retried after this. */
 const SERIES_RETRY_MS = 30_000;
 const HATCH_PX = 6;

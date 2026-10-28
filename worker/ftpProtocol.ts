@@ -136,13 +136,29 @@ export async function startSession(
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
-  const send = (cmd: string) => writer.write(enc.encode(cmd + "\r\n"));
-  const cmd = async (c: string, cls: number, name = c.split(" ")[0] ?? c) => {
-    await send(c);
-    return expectReply(name, await replies.next(), cls);
+  // After a timeout or closed socket the control channel can be out of step (a reply still pending), so the
+  // session is dead: every later command fails at once and the caller opens a new one.
+  let broken: Error | null = null;
+  const breakWith = (e: unknown) => {
+    broken ??= new Error(`FTP session unusable after: ${e instanceof Error ? e.message : String(e)}`);
+  };
+  const reply = async () => {
+    try {
+      return await replies.next();
+    } catch (e) {
+      breakWith(e);
+      throw e;
+    }
   };
 
-  expectReply("connect", await replies.next(), 2);
+  const send = (cmd: string) => writer.write(enc.encode(cmd + "\r\n"));
+  const cmd = async (c: string, cls: number, name = c.split(" ")[0] ?? c) => {
+    if (broken) throw broken;
+    await send(c);
+    return expectReply(name, await reply(), cls);
+  };
+
+  expectReply("connect", await reply(), 2);
   await cmd("USER anonymous", 3);
   await cmd("PASS anonymous@", 2);
   await cmd("TYPE I", 2);
@@ -156,8 +172,14 @@ export async function startSession(
     dataP.catch(() => {}); // avoid unhandled rejection if the command fails first
     try {
       await cmd(command, 1, name);
-      const bytes = await dataP;
-      expectReply(name, await replies.next(), 2);
+      let bytes: Uint8Array;
+      try {
+        bytes = await dataP;
+      } catch (e) {
+        breakWith(e);
+        throw e;
+      }
+      expectReply(name, await reply(), 2);
       return bytes;
     } catch (e) {
       try {

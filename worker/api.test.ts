@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { dayCacheControl, handleApi, type ApiBucket } from "./api";
 
 vi.mock("./ftp", () => ({ openBomFtp: vi.fn() }));
-import { productsForMinute, radarGlob, shouldRefreshMeta } from "./index";
+import { radarGlob, shouldRefreshMeta } from "./index";
 
 const NOW = Date.UTC(2026, 9, 27, 3, 0); // 2026-10-27 03:00 UTC
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
@@ -253,13 +253,13 @@ describe("handleApi", () => {
 
 describe("dayCacheControl", () => {
   const midnight = Date.UTC(2026, 9, 27);
-  it("is short-lived until 2 h after the day ends", () => {
+  it("is short-lived until 3 h after the day ends", () => {
     expect(dayCacheControl("20261026", midnight + 3_600_000)).toBe("public, max-age=60");
-    expect(dayCacheControl("20261026", midnight + 2 * 3_600_000 - 1)).toBe("public, max-age=60");
+    expect(dayCacheControl("20261026", midnight + 3 * 3_600_000 - 1)).toBe("public, max-age=60");
   });
-  it("is immutable once 2 h past the day end", () => {
-    expect(dayCacheControl("20261026", midnight + 2 * 3_600_000)).toBe("public, max-age=31536000, immutable");
+  it("is immutable once 3 h past the day end", () => {
     expect(dayCacheControl("20261026", midnight + 3 * 3_600_000)).toBe("public, max-age=31536000, immutable");
+    expect(dayCacheControl("20261026", midnight + 4 * 3_600_000)).toBe("public, max-age=31536000, immutable");
   });
   it("is short-lived for today and null for future or invalid days", () => {
     expect(dayCacheControl("20261027", midnight + 3_600_000)).toBe("public, max-age=60");
@@ -281,20 +281,9 @@ describe("radarGlob / shouldRefreshMeta", () => {
     expect(radarGlob("marburg")).toBe("/anon/gen/radar/IDR50[1-4].T.*.png");
     expect(radarGlob("stapylton")).toBe("/anon/gen/radar/IDR66[1-4].T.*.png");
   });
-  it("shouldRefreshMeta is true only at UTC minutes 0 and 1", () => {
+  it("shouldRefreshMeta is true only at UTC minute 0", () => {
     expect(shouldRefreshMeta(Date.UTC(2026, 9, 27, 3, 0))).toBe(true);
-    expect(shouldRefreshMeta(Date.UTC(2026, 9, 27, 3, 1, 59))).toBe(true);
-    for (const m of [2, 3, 30, 59]) expect(shouldRefreshMeta(Date.UTC(2026, 9, 27, 3, m))).toBe(false);
-  });
-});
-
-describe("productsForMinute", () => {
-  it("even UTC minute is Marburg, odd is Stapylton", () => {
-    expect(productsForMinute(Date.UTC(2026, 9, 27, 3, 4))).toEqual(["IDR501", "IDR502", "IDR503", "IDR504"]);
-    expect(productsForMinute(Date.UTC(2026, 9, 27, 3, 5))).toEqual(["IDR661", "IDR662", "IDR663", "IDR664"]);
-  });
-  it("handles minute boundaries (59 odd, 00 even) with sub-minute ms", () => {
-    expect(productsForMinute(Date.UTC(2026, 9, 27, 3, 59, 59, 999))[0]).toBe("IDR661");
-    expect(productsForMinute(Date.UTC(2026, 9, 27, 4, 0, 0, 0))[0]).toBe("IDR501");
+    expect(shouldRefreshMeta(Date.UTC(2026, 9, 27, 3, 0, 59))).toBe(true);
+    for (const m of [1, 2, 3, 30, 59]) expect(shouldRefreshMeta(Date.UTC(2026, 9, 27, 3, m))).toBe(false);
   });
 });

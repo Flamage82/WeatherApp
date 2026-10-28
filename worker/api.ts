@@ -28,11 +28,11 @@ function dayToMs(day: string): number {
   return back.getUTCFullYear() === y && back.getUTCMonth() === m - 1 && back.getUTCDate() === d ? ms : NaN;
 }
 
-const DAY_SETTLE_MS = 2 * 3_600_000;
+const DAY_SETTLE_MS = 3 * 3_600_000;
 
 /**
  * Cache-Control for a UTC day (YYYYMMDD) of archived data, or null when the day is invalid or in the future (404).
- * A day is final only 2 h after it ends, since ingest lags the radar and backfills can land after midnight.
+ * A day is final only 3 h after it ends, since ingest lags the radar and backfills can land after midnight.
  */
 export function dayCacheControl(day: string, nowMs: number): string | null {
   const dayMs = dayToMs(day);

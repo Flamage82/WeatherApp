@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ReplyReader, parsePasv, expectReply } from "./ftpProtocol";
+import { ReplyReader, parsePasv, expectReply, startSession } from "./ftpProtocol";
 
 const enc = new TextEncoder();
 
@@ -62,5 +62,19 @@ describe("expectReply", () => {
     expect(() => expectReply("PASS", { code: 530, text: "Login incorrect." }, 2)).toThrow(
       "FTP PASS: 530 Login incorrect.",
     );
+  });
+});
+
+describe("startSession", () => {
+  it("a data timeout kills the session: later commands fail at once", async () => {
+    const replies = "220 hi\r\n331 u\r\n230 p\r\n200 t\r\n227 Entering Passive Mode (1,2,3,4,0,21)\r\n150 go\r\n";
+    const control = {
+      readable: new ReadableStream<Uint8Array>({ start: (c) => c.enqueue(enc.encode(replies)) }),
+      writable: new WritableStream<Uint8Array>(),
+    };
+    const hung = { readable: new ReadableStream<Uint8Array>({ start() {} }) };
+    const ftp = await startSession(control, () => hung, 50);
+    await expect(ftp.retrieve("/a.png")).rejects.toThrow(/timeout/i);
+    await expect(ftp.retrieve("/b.png")).rejects.toThrow(/unusable/);
   });
 });

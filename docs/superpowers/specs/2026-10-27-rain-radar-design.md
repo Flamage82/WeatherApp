@@ -32,7 +32,7 @@ The radar is the first project. A second screen with observations and a forecast
 5. Opening the app shows the latest radar fast. Target: first useful picture in under ~2 s on 4G.
 
 ### Non-goals (for this version)
-- **Predicting storms forward (nowcasting).** The user wants this eventually ("super awesome") but **not in the MVP (user)**. The design must leave room for it (see §9).
+- ~~Predicting storms forward (nowcasting).~~ **Now in scope (user, 2026-10-28)**, built in Task 18. See §7.7.
 - The observations/forecast screen (a separate project, §9).
 - Multiple saved locations, location search, or "use my location". The location is **hard-coded (user)**.
 - Radars outside the user's area. No national coverage.
@@ -53,6 +53,7 @@ The radar is the first project. A second screen with observations and a forecast
   - **IDR50x, Marburg.** Centre −27.608, 152.539, about **8 km** from home. **Primary radar (call).**
   - **IDR66x, Brisbane (Mt Stapylton).** Centre −27.718, 153.240, about **73 km** from home. **Backup radar (call)**, used when Marburg is missing or stale.
   - Each radar comes in four ranges: suffix `1` = 512 km, `2` = 256 km, `3` = 128 km, `4` = 64 km. All four exist for both radars.
+  - **All four ranges are used (restored by the user, 2026-10-28):** `IDR501–504` and `IDR661–664`. Task 20 had briefly dropped the 512 km and 256 km ranges to fit the free plan's CPU budget; the move to Workers Paid undid that.
 
 ## 4. Constraints
 
@@ -87,7 +88,7 @@ The radar is the first project. A second screen with observations and a forecast
 ## 5. Architecture **(call)**
 
 ```
-BOM anonymous FTP ──(every 5 min, cron)──► Cloudflare Worker ──► R2 bucket
+BOM anonymous FTP ──(every min, cron)───► Cloudflare Worker ──► R2 bucket
                                                 │                   (frames + manifests)
                                                 ▼
                          same Worker serves:  /           React app (static assets)
@@ -96,14 +97,14 @@ BOM anonymous FTP ──(every 5 min, cron)──► Cloudflare Worker ──►
                                      browser (phone / desktop)
 ```
 
-- **One Cloudflare Worker** does three jobs: (a) serves the built React app as Workers static assets; (b) answers `/api/*` from R2; (c) runs on a **cron trigger every minute** to fetch new frames. It alternates between radars, Marburg on even minutes and Stapylton on odd, so each run stays under the free plan's 10 ms CPU limit (measured in the Task 0 test: 4–9 ms for login + filtered listing + one file). Because the app and the API share an origin, no CORS setup is needed. (Pages Functions can't run cron triggers, which is why this is a Worker rather than Pages.)
+- **One Cloudflare Worker** does three jobs: (a) serves the built React app as Workers static assets; (b) answers `/api/*` from R2; (c) runs on a **single cron trigger every minute** (`* * * * *`) to fetch new frames for **both radars in one run**, in parallel, each on its own FTP connection, so one radar failing doesn't stop the other. Because the app and the API share an origin, no CORS setup is needed. (Pages Functions can't run cron triggers, which is why this is a Worker rather than Pages.)
 - **Fetching:** the Worker speaks FTP over raw TCP using `connect()` from `cloudflare:sockets`. It logs in anonymously, uses passive mode, lists `/anon/gen/radar/`, keeps only files for the configured products (`IDR501–504`, `IDR661–664`) whose timestamps it hasn't already stored, downloads them, and writes them to R2 unchanged. BOM's PNGs pass through unchanged; any decoding happens in the browser. It also fetches the eight `.map` coordinate files once and refreshes them occasionally.
 - **R2 layout (builder may adjust):** `frames/{product}/{YYYYMMDDHHMM}.png`, `meta/{product}.map.json`, and `manifest/{product}.json`. A manifest lists the timestamps from the **last 24 hours** and the time of the last successful fetch.
 - **Frames are kept forever and never deleted (user).** About 8 KB per frame, so ~18 MB/day or ~6.5 GB/year across the 8 products. That's inside R2's 10 GB free storage for roughly 1.5 years, then a few cents a month. Only stamps older than 24 h are dropped, and only from the manifest, so it stays small. Older frames are found with an R2 `list` on the prefix `frames/{product}/{YYYYMMDD}` (§6.4), so no separate archive index is written.
 - **Volume:** 8 products × 288 frames/day ≈ 2,300 small writes/day, far inside free-tier limits.
 - **Caching:** frame PNGs never change, so they're served with long, immutable cache headers. Manifests use a short max-age (about 30 s).
-- **Health:** each manifest records `lastFetchOk` and `lastError`. To fit the free plan **(user: squeeze onto free, 2026-10-27)**, manifests are only written when something changes. Staleness in the app is therefore judged from the newest frame's age, and `lastFetchOk` is the last time that product actually received frames.
-- **Free-plan CPU budget (≤ 10 ms per run):** one combined file listing per radar; a tiny `state/{radar}.json` holding the newest stamp per product, so idle runs skip all manifest reads and writes; radar geometry checked hourly; at most 2 downloads per product per run.
+- **Health:** manifests are not stored; `/api/manifest` is built on request from an R2 list plus `state/{radar}.json` (`newest`, `lastOk`, `lastError` per product). Staleness in the app is judged from the newest frame's age, and `lastFetchOk` is the last time that product actually received frames.
+- **Plan (user, 2026-10-28): Workers Paid.** The free-plan CPU squeeze (Tasks 16, 17, 20) is over: each run lists once per radar, downloads every missing in-window frame (no caps), and samples the home level inline for the tape products. A tiny `state/{radar}.json` still saves needless R2 work, and radar geometry is checked hourly.
 
 ## 6. The screen
 
@@ -126,7 +127,8 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 - **Visible span:** defaults to 40 minutes across the tape (±20 min around the playhead) **(call)**.
 - **Tape zoom (user):** pinch the tape on touch, or Ctrl/⌘ + scroll over it on desktop, to change the span from **20 min up to 7 days**. Zoom is centred on the playhead. Double-tap or double-click resets to 40 min **(call)**. Drag and flick distance scale with the span, so at 7 days a short drag moves hours. Time labels adapt their step (10 min → 1 h → 6 h → 1 day).
 - **The graph when zoomed out (call):** decoding every frame in the browser for a multi-day span is too heavy. So the fetch job also records the **raw per-frame "rain at home" value** (no interpolation) for the tape products as each frame arrives. It attaches the value to the stored frame itself as R2 custom metadata, so there are no extra writes. `/api/series/{product}/{YYYYMMDD}` lists that day's frames with their metadata. At spans up to 3 h the tape uses the smooth interpolated values computed in the browser; above 3 h it uses the stored per-frame values. Frames stored before this feature ships have no recorded values, and those stretches show as "no data".
-- The tape ends at the newest frame ("now"). With nowcasting later, it continues past "now" as a dashed, faded section (§9).
+- The tape continues 60 min past the newest frame ("now") into the nowcast (§7.7). That section has a **slightly different, violet-tinted background (user)** so it's obvious that it's predicted, and the graph is drawn faded there. Beyond +60 min it's shaded as "no data".
+- **Borders (user):** the tape and the speed lever have a thin light border in dark mode (subtle dark in light mode), so they stay visible over a mostly black map.
 - **"Rain at my place" (call):** the highest interpolated intensity within about 1 km of home. Taking the highest value smooths over small position errors and pixel noise.
 - **Where the tape's data comes from (call):** the tape **always** uses the active radar's sharpest range that covers home. For Marburg that's **IDR504 (64 km, ~250 m per pixel)**; on backup it's Mt Stapylton's 128 km range, IDR663, since home is ~73 km out and outside IDR664. It does **not** follow map zoom, so the graph never changes shape when you zoom. It changes source only when the whole loop switches radar (§7.6). The tape only needs a small patch of pixels around home, so it can be worked out on the CPU from a cropped area of each frame and its motion field. This product's frames and motion fields therefore load at start-up alongside the map's first range (§7.5).
 
@@ -136,12 +138,12 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 - **It stays where it's left (call).** Play/pause switches between paused and the lever's last non-zero setting.
 - Values are continuous. The builder may add light detents at 0, ±1×, ±2× and ±4×.
 
-### 6.4 Playback window and looping **(call)**
+### 6.4 Playback window and stopping
 - **Scroll back as far as the archive goes (user).** Dragging the tape back has no 24 h wall. Older frames load on demand as you approach the edge of what's loaded. The Worker answers `GET /api/day/{product}/{YYYYMMDD}` (UTC day) with that day's stamps, using an R2 `list` on `frames/{product}/{YYYYMMDD}`. Past days are cached as immutable.
 - **Memory cap (call):** the browser keeps at most ~6 h of decoded frames and motion fields per product, evicting whichever are furthest from the playhead.
-- **Loop window (call):** the 2 h window that contains the playhead, centred on it where possible and never extending past the newest frame. It's fixed when Play is pressed. At "now" that's the last 2 hours. Scrolled back to yesterday's storm, it loops the 2 hours around the storm.
-- Playing forward reaches the end of the loop window, holds for about 1 s, then loops to its start. Playing backward mirrors that.
-- New frames arriving while the app is open are added to the end automatically. If the playhead is sitting at "now" it follows the new frame; otherwise it stays put.
+- **No looping (user, 2026-10-28; replaces the earlier 2 h loop window).** Playback stops (speed → 0, the last speed is remembered for Play) when it reaches either end: the start of the archive going backwards, or the end of the nowcast (newest + 60 min) going forwards.
+- **Auto-stop at "now" (user).** "Now" means the newest frame, the boundary between observed and predicted. When playback crosses it in either direction, it stops exactly there, **unless the user is dragging the tape (including a coasting flick) or holding the speed lever**; then it keeps going per their input. It only fires on a crossing, so pressing Play at "now" plays the forecast through to +60 min, and pressing Play from the past stops at "now".
+- New frames arriving while the app is open are added to the end automatically. If the playhead is sitting at "now" (within 30 s) it follows the new frame. If it's inside the forecast, it keeps its clock time, clamped to the new forecast end. Otherwise it stays put.
 
 ### 6.5 Map interaction
 - Drag pans and pinch or scroll zooms the map, as usual. **Only the tape and the lever control time**, so map and time gestures never clash.
@@ -163,6 +165,7 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 ### 7.3 From PNG to intensity field
 - Decode each PNG in the browser, classify every pixel by RGB against the BOM legend (§4.1), and produce a 512×512 single-channel **intensity field** (log mm/h, or the level 0–15). Anything not in the legend counts as zero.
 - Draw the field as a custom WebGL layer in MapLibre. The fragment shader reprojects from the frame's **gnomonic** projection, using the `.map` centre and corners, into the map's Web Mercator projection, then applies the colour ramp. Upsampling should be smooth (bilinear on the intensity, *then* colour), not blocky.
+- **Display smoothing (user, 2026-10-28; like the BOM phone app):** on the map, the intensity is upsampled with a **cubic B-spline** between native 1 km cell centres instead of bilinear, giving rounded blobs with no grid artefacts. B-spline weights are non-negative and sum to 1, so it never exceeds the local maximum (no invented rain), but it softens a lone cell's peak a little. It's display-only: the tape graph, the rain hint and the CPU/GPU parity check keep the bilinear sampler. `?smooth=0` (bilinear) and `?smooth=cr` (clamped Catmull-Rom) remain as URL switches for comparison. **Banded (stepped) colours were offered and deliberately not done**; the user prefers the continuous ramp.
 
 ### 7.4 Smooth motion between frames **(call; the algorithm is the builder's)**
 - For each pair of neighbouring frames, estimate a dense **motion field**, i.e. optical flow: which way and how far each patch of rain moved. Do this on the intensity fields, ideally in a Web Worker or on the GPU, as frames arrive.
@@ -172,12 +175,19 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 - Candidate approaches the builder may evaluate: pyramidal Lucas–Kanade, a TV-L1 or Farnebäck-style dense flow, or block matching/phase correlation on a coarse grid followed by smoothing. Radar fields are small (512²) and the window holds about 24 pairs, so computing once per pair is affordable.
 
 ### 7.5 Picking a range as you zoom **(call)**
-- The app shows the sharpest range of the active radar that covers the visible map: 64 km when zoomed in tight, up to 512 km zoomed right out. When the choice changes, it cross-fades between ranges.
+- The app shows the sharpest range of the active radar that covers the visible map: 64 km when zoomed in tight, 128 km otherwise (the 256/512 km ranges are dropped, §3). When the choice changes, it cross-fades between ranges. Zoomed out beyond the 128 km frame, the radar simply ends at the frame edge; limit the map's minimum zoom so the frame still fills most of a phone screen **(call, Task 20)**.
 - Frames and motion fields are handled per range. On start-up, load the **128 km** range (`IDR503`) first for the map, along with the tape's source (`IDR504`, §6.2). Load other ranges when zoom calls for them.
 - Because interpolation is per range, mixing ranges inside one animation isn't required.
 
 ### 7.6 Backup radar **(call)**
 - If Marburg's newest frame is over about 20 min old, or frames are missing, switch the whole loop to Mt Stapylton (IDR66x) and say so on screen. Never mix the two radars within one loop. A manual switch between radars is nice to have, if cheap.
+
+### 7.7 Nowcast **(user, 2026-10-28; built in Task 18)**
+- The playhead may go up to **60 min past the newest frame**. There, the map shows the newest frame advected along a **forecast motion field**: plain semi-Lagrangian backward advection with constant velocity, `level(p, lead) = newest(p − lead · V(p))`.
+- `V` is the mean of the last ≤ 3 pair flows in px/ms, filled across the **whole** frame by 1/d² weighting (the interpolation flow only reaches ~48 px past rain, which would stall advected rain).
+- The forecast fades with lead time (opacity 1 → 0.55 at +60 min). The clock shows "+25 min forecast".
+- **Rain hint** under the clock, from the forecast at home: "Rain in ~25 min · heavy", "Raining now · moderate · until ~20 min", or nothing. Minutes round to 5; a level of at least 0.5 counts as rain.
+- **Known limits:** no growth or decay (good for organised bands, poor for pop-up storms), and rain can't enter from outside the frame, so the upwind edge of the 64 km range empties by +40–60 min. The hint uses the tape product (`IDR504`), so a fast storm still more than ~60 km away can be missed late in the hour. Using `IDR503` for the hint would fix that (open idea).
 
 ## 8. Risks and the first spike
 
@@ -191,7 +201,7 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 
 ## 9. Leaving room for later
 
-- **Nowcasting (user: wanted, not MVP).** Extrapolate the latest motion field forward 30–60 min. The tape continues past "now" as a dashed, faded section, and the future could show "rain at your place in ~25 min, heavy". Design constraint now: the motion fields from §7.4 are real data structures that stay available. Time handling must allow a playhead later than the newest frame.
+- ~~Nowcasting~~: built (§7.7).
 - **Observations and forecast screen (user: planned, will become the main screen).** Use client-side routing from the start, e.g. `/radar`, with `/` redirecting there until the main screen exists. Write the fetcher Worker so it's easy to add more jobs, such as fetching BOM observations or forecast products, later.
 
 ## 10. Left to the builder

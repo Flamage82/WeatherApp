@@ -113,33 +113,51 @@ export async function sampleHomeFromPng(png: Uint8Array, g: RadarGeometry): Prom
   const { x, y, rPx } = homePixel(g);
   const cell = CELL_SIZE[g.product];
   const rowBytes = Math.ceil((SIZE * depth) / 8);
+  const stride = rowBytes + 1;
+  const perByte = 8 / depth;
+  // The disc spans rows [firstRow, lastRow] and columns up to lastCol (one pixel of margin for cell alignment).
+  const firstRow = Math.max(0, Math.floor(y - rPx) - 1);
   const lastRow = Math.min(SIZE - 1, Math.floor(y + rPx) + 1);
-  const raw = await inflatePrefix(concat(chunks(png, "IDAT")), (lastRow + 1) * (rowBytes + 1));
+  const lastCol = Math.min(SIZE - 1, Math.floor(x + rPx) + 1);
+  const lastByte = 1 + Math.floor(lastCol / perByte); // index within a row, after the filter byte
+  const raw = await inflatePrefix(concat(chunks(png, "IDAT")), (lastRow + 1) * stride);
 
-  // Un-filter in place; indexed pixels are at most one byte, so bpp is 1.
-  for (let r = 0; r <= lastRow; r++) {
-    const row = r * (rowBytes + 1);
+  // Un-filter in place, as little as possible. A pixel depends only on pixels above and to its left, so
+  // columns right of the disc are never needed, and rows above the nearest None/Sub row (filter 0 or 1,
+  // which ignore the row above) are not needed either. Indexed pixels are at most one byte, so bpp is 1.
+  const zero = new Uint8Array(stride); // the "row above" row 0
+  let r0 = firstRow;
+  while (r0 > 0 && raw[r0 * stride]! > 1) r0--;
+  for (let r = r0; r <= lastRow; r++) {
+    const row = r * stride;
+    const prev = r > 0 ? row - stride : 0;
+    const U = r > 0 ? raw : zero;
     const filter = raw[row]!;
-    for (let i = 1; i <= rowBytes; i++) {
-      const left = i > 1 ? raw[row + i - 1]! : 0;
-      const up = r > 0 ? raw[row - rowBytes - 1 + i]! : 0;
-      const upLeft = r > 0 && i > 1 ? raw[row - rowBytes - 1 + i - 1]! : 0;
-      let add = 0;
-      if (filter === 1) add = left;
-      else if (filter === 2) add = up;
-      else if (filter === 3) add = (left + up) >> 1;
-      else if (filter === 4) {
+    if (filter === 0) continue;
+    if (filter === 1) {
+      for (let i = 2; i <= lastByte; i++) raw[row + i] = (raw[row + i]! + raw[row + i - 1]!) & 255;
+    } else if (filter === 2) {
+      for (let i = 1; i <= lastByte; i++) raw[row + i] = (raw[row + i]! + U[prev + i]!) & 255;
+    } else if (filter === 3) {
+      raw[row + 1] = (raw[row + 1]! + (U[prev + 1]! >> 1)) & 255;
+      for (let i = 2; i <= lastByte; i++) raw[row + i] = (raw[row + i]! + ((raw[row + i - 1]! + U[prev + i]!) >> 1)) & 255;
+    } else if (filter === 4) {
+      let left = 0;
+      let upLeft = 0;
+      for (let i = 1; i <= lastByte; i++) {
+        const up = U[prev + i]!;
         const p = left + up - upLeft;
         const pa = Math.abs(p - left);
         const pb = Math.abs(p - up);
         const pc = Math.abs(p - upLeft);
-        add = pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft;
-      } else if (filter !== 0) throw new Error(`bad PNG filter ${filter}`);
-      raw[row + i] = (raw[row + i]! + add) & 255;
-    }
+        const v = (raw[row + i]! + (pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft)) & 255;
+        raw[row + i] = v;
+        left = v;
+        upLeft = up;
+      }
+    } else throw new Error(`bad PNG filter ${filter}`);
   }
 
-  const perByte = 8 / depth;
   const mask = (1 << depth) - 1;
   return discMax(
     (px, py) => {

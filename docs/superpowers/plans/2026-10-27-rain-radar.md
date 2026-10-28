@@ -4,7 +4,7 @@
 
 **Goal:** A personal rain-radar web app. It shows BOM Marburg/Mt Stapylton radar on a real map, with smooth motion between frames, a refined colour ramp, a "rain at my place" tape scrubber, and a speed lever.
 
-**Architecture:** A single Cloudflare Worker does three jobs: (a) serves the Vite/React build as static assets, (b) answers `/api/*` from an R2 bucket, (c) runs a 1-minute cron (alternating radars) that pulls new frames from BOM's anonymous FTP over `cloudflare:sockets` into R2. The browser decodes the frames into intensity fields, estimates motion between neighbouring frames in a Web Worker, and draws interpolated frames through a MapLibre custom WebGL layer.
+**Architecture:** A single Cloudflare Worker does three jobs: (a) serves the Vite/React build as static assets, (b) answers `/api/*` from an R2 bucket, (c) runs a 1-minute cron that pulls new frames from BOM's anonymous FTP over `cloudflare:sockets` into R2. Until Task 20 it alternates radars; Task 20 moves it to one trigger per radar and at most one frame per run. The browser decodes the frames into intensity fields, estimates motion between neighbouring frames in a Web Worker, and draws interpolated frames through a MapLibre custom WebGL layer.
 
 **Tech Stack:** TypeScript, Vite + `@cloudflare/vite-plugin`, Wrangler, Cloudflare Workers + R2 + Cron Triggers, React + react-router, MapLibre GL JS, `fast-png` (pure-JS PNG decode), Vitest.
 
@@ -13,11 +13,11 @@
 ## Global Constraints
 
 - Home is hard-coded in one place: `HOME = { lat: -27.67217111736596, lon: 152.49661614726207 }` (`shared/config.ts`).
-- Products: Marburg `IDR501` (512 km), `IDR502` (256 km), `IDR503` (128 km), `IDR504` (64 km). Mt Stapylton `IDR661`–`IDR664`, same suffix meaning. No other products are fetched.
+- Products: all eight: Marburg `IDR501–504`, Mt Stapylton `IDR661–664` (suffix 1=512 km, 2=256, 3=128, 4=64). No other products are fetched. (Task 20 dropped 501/502/661/662 on 2026-10-28; Task 21 restored them after the move to Workers Paid.)
 - Data source is **FTP only**: `ftp://ftp.bom.gov.au/anon/gen/radar/` and `.../radar_transparencies/coordinates/`. Never fetch from `www.bom.gov.au` over HTTPS, and never spoof a browser User-Agent.
 - Frame filenames: `IDR{nnn}.T.{YYYYMMDDHHMM}.png`, UTC. Ignore `*.png.tmp`.
 - Pixels are classified by **RGB value**, never by palette index. Anything that isn't a legend colour counts as zero rain.
-- Frame PNGs in R2 are **never deleted** (user, 2026-10-27). The manifest lists only the last 24 h. Default playback window: last 2 h. The tape scrolls back with **no 24 h limit**, as far as the archive goes (user); older stamps come from `/api/day/:product/:YYYYMMDD`.
+- Frame PNGs in R2 are **never deleted** (user, 2026-10-27). The manifest lists only the last 24 h. No loop window: playback stops at the ends and auto-stops on crossing "now" (spec §6.4). The playhead may go up to newest + 60 min (nowcast, spec §7.7). The tape scrolls back with **no 24 h limit**, as far as the archive goes (user); older stamps come from `/api/day/:product/:YYYYMMDD`.
 - 1× speed = 10 min of radar time per 1 s of real time. Lever range: −4× to +4×.
 - Tape span defaults to 40 min (±20 min around the fixed centre playhead), and is zoomable from 20 min to 7 days (pinch / Ctrl+wheel; double-tap resets). No snapping to frames. Above 3 h of span the tape graph uses server-recorded per-frame values (`/api/series`).
 - The tape source is the active radar's sharpest range that covers home: `IDR504` (Marburg) or `IDR663` (Stapylton). It does not follow map zoom.
@@ -25,7 +25,7 @@
 - Displayed times are in `Australia/Brisbane`.
 - On-screen attribution: "Radar data © Commonwealth of Australia, Bureau of Meteorology" plus the base map's OSM credit.
 - No auth or lock on the site.
-- Stay on the Workers free plan. **Ask the user before switching to Workers Paid.** The user chose to squeeze onto the free plan (2026-10-27): every cron run targets ≤ 10 ms CPU.
+- **Workers PAID plan (user upgraded 2026-10-28).** No CPU squeezing: one cron every minute (`* * * * *`) runs the whole ingest for both radars. No per-run frame caps, no pendingHome/due-frame scheduling.
 
 ## Review Focus
 
@@ -665,6 +665,115 @@ Task 16 measured download runs at a median of 19 ms. The biggest remaining per-d
 
 ---
 
+### Task 18: Nowcast + playback stop rules (DONE 2026-10-28)
+
+Brief: `.superpowers/sdd/2026-10-27-rain-radar/task-18-brief.md`. Spec §6.2, §6.4, §7.7. In short:
+- `forecastFlow` (mean of the last ≤ 3 flows in px/ms, filled over the whole frame), a forecast mode in the shader and its CPU mirror, and the playhead allowed up to newest + 60 min.
+- No looping. Playback stops at the ends, and auto-stops on crossing "now" unless the user is dragging the tape or holding the lever.
+- Violet-tinted forecast section on the tape, "+N min forecast" on the clock, and the rain hint line.
+- Borders on the tape and lever (`--control-border` / `--control-shadow` in `index.html`).
+
+### Task 19: Smoother map upsampling (DONE 2026-10-28)
+
+Spec §7.3. Display-only cubic B-spline level lookup in `src/render/shaders.ts` (`u_smooth`; `?smooth=0|cr` switches in `radarLayer.ts`). The CPU mirror and the parity check stay bilinear. Banded colours are deliberately not done.
+
+---
+
+### Task 20: CPU pass 2 — every cron run ≤ 10 ms (SUPERSEDED by Task 21: the user moved to Workers Paid, so only its Step 1/2 findings and the cheaper `sampleHomeFromPng` survive)
+
+User decisions (2026-10-28):
+- **Only fetch the 128 km and 64 km ranges.** `IDR501/502/661/662` are dropped.
+- **At most one frame per run is fine.**
+- **Newest first, backfill on spare runs**, giving up on frames older than a few hours.
+- **Measure the home sample before deciding** how to handle it.
+- **If a run still can't fit, stop and ask** (Workers Paid is the fallback).
+
+Measured before this task (after Tasks 16/17/15):
+- Idle runs: 6–8 ms.
+- +1 frame: ~9 ms.
+- +3–4 frames: 12–23 ms (~3 ms per download).
+- The home-sample cost on `IDR504` frames is unmeasured.
+
+**Budget maths.**
+- With 4 products, BOM publishes 4 frames per 5 min.
+- With **one cron trigger per radar** (below), each radar gets 5 runs per 5 min for its 2 new frames, which leaves 3 spare runs per 5 min for backfill and meta.
+
+**Files:**
+- Modify:
+  - `shared/config.ts` (PRODUCTS, RADARS)
+  - `worker/ingest.ts`, `worker/index.ts`
+  - `wrangler.jsonc` (crons)
+  - `worker/api.ts` (only if the state shape changes)
+  - `src/geo/*` (pickRange), `src/radar/RadarScreen.tsx` (map minZoom)
+  - Tests and fixtures that name the dropped products
+- Test: `worker/ingest.test.ts`, `worker/api.test.ts`, and the affected `src/` tests (lean: update, don't add many)
+
+- [ ] **Step 1: Drop the 512/256 km products.**
+  - In `shared/config.ts`, `PRODUCTS` = `IDR503, IDR504, IDR663, IDR664`, and `RADARS[*].products` likewise. Keep the tape products (`IDR504`, `IDR663`).
+  - The API then 404s the dropped products. Their R2 objects stay (never deleted).
+  - `pickRange` now picks between 128 and 64 km only.
+  - Set the map's `minZoom` so that, on a 375 px-wide phone, the 128 km frame (~256 km across) still spans at least the screen width.
+  - Fix the tests and fixtures that reference the dropped products (e.g. `pickRange` wide-view cases). `npm test` must pass.
+
+- [ ] **Step 2: Measure the components before redesigning.**
+  - Add a **temporary** route, e.g. `GET /__bench?step=N` (remove it before finishing; it must never ship). It runs one cumulative stage per request:
+    1. state get + parse only
+    2. + FTP connect/login/QUIT
+    3. + one NLST of the radar glob
+    4. + one RETR of the newest IDR503 frame
+    5. + R2 put of it under a `bench/` key (delete the key afterwards)
+    6. + `sampleHomeFromPng` on an IDR504 frame
+  - Hit each stage ~10 times. Read `cpuTime` from `npx wrangler tail rain-radar --format json`.
+  - Inside a Worker, `Date.now()` doesn't advance during CPU work, so in-code timers are useless. `cpuTime` from tail is the measurement.
+  - Also check the Worker bundle for heavy imports, since startup counts on a cold isolate. For example, does the Worker pull in `fast-png` through `shared/homeSample.ts` → `decodeFrame`? If so, split the imports so the Worker only bundles the DecompressionStream path.
+  - Record a table of stage → median and max cpuTime in the progress ledger. This table decides the design below.
+
+- [ ] **Step 3: One cron trigger per radar** (replaces even/odd minute alternation).
+  - In `wrangler.jsonc`, use `crons: ["* * * * *", "*/1 * * * *"]`. Both fire every minute. `event.cron` picks the radar: Marburg for the first string, Stapylton for the second.
+  - Each radar keeps its own `state/{radar}.json`, so the two concurrent invocations never share state.
+  - **Verify first** that Cloudflare accepts two such crons and fires both: check the docs or deploy and watch the tail. If not, fall back to Marburg on `* * * * *` and Stapylton on `*/2 * * * *`: Stapylton gets 2.5 runs per 5 min for 2 frames, which is tight but workable. If the user then wants more, a Durable Object alarm (free plan; check its CPU and duration limits first) can give any cadence, including 30 s.
+
+- [ ] **Step 4: One frame per run, no FTP on idle runs.** Rework `runIngest` per radar.
+  - **State.** `state/{radar}.json` adds, per product:
+    - `missing: string[]`: known gaps, newest first, pruned past `BACKFILL_MAX_AGE_MS = 6 h`
+    - `lastListMs`
+    - for the tape product, a cached `geometry`, so tape runs skip the meta `get`
+  - Keep `newest`, `lastOk` and `lastError`, which `/api/manifest` uses.
+  - **What's due.** BOM stamps for these products are every 5 min at a fixed minute phase. For a product, `expected = newest + 5 min` is "due" once `now ≥ expected + PUBLISH_LAG_MS`.
+    - Measure the real lag from a few listings; start at about 2 min.
+  - **Per run, pick at most one action**, in this order:
+    1. The due product with the oldest `expected`, tape product first on ties: RETR that exact name, with no listing.
+       - On success: put (with the home metadata if it's the tape product), then advance `newest`.
+       - On 550: leave it, and the next run retries.
+    2. Else, if a product is overdue by more than ~12 min, or its `lastListMs` is older than 30 min: one NLST to resync. Set `newest` to the newest listed stamp, and add unstored stamps within 6 h to `missing`. One R2 list, as today, filters out already-stored stamps.
+    3. Else, if `missing` is non-empty: RETR + put its newest entry.
+    4. Else, if meta is due (7-day rule): refresh one product's `.map`.
+    5. Else: **idle. Don't open FTP at all.** Just read the state and return. Opening FTP lazily, only for actions 1–4, is the biggest expected saving.
+  - **Write the state only if it changed** (as now).
+  - **Home sample.** If Step 2 shows that the sample pushes a tape-frame run over 10 ms, split it.
+    - Put the frame without metadata, and add its stamp to `pendingHome` in the state.
+    - A later spare run then does R2 get → sample → put the same bytes with `customMetadata`. That's one extra put per tape frame, about 576 a day, well inside R2's free tier.
+    - Otherwise keep it inline.
+  - **Log one line per run** saying what it did (`IDR504 202610281205 +home`, `list IDR503`, `backfill IDR663 …`, `idle`). This lets the tail table be grouped by action.
+
+- [ ] **Step 5: Tests (lean).**
+  - Idle run → 1 state get, 0 FTP opens, 0 puts.
+  - Due product → exactly 1 RETR by name, 1 frame put, state advanced.
+  - 550 → no advance, no throw.
+  - Overdue → NLST resync fills `missing`.
+  - Spare run → backfills the newest `missing` entry; entries older than 6 h are pruned.
+  - Never more than 1 RETR of a frame per run.
+  - `npm test` and `npx tsc --noEmit` clean.
+
+- [ ] **Step 6: Deploy and measure.**
+  - Remove `/__bench`, then run `npm run deploy`.
+  - Tail ≥ 30 runs per radar. Report a table of action → median and max cpuTime.
+  - **Target: every run ≤ 10 ms.**
+  - If any action type still exceeds it after the fixes above, **stop and ask the user** with the numbers (Workers Paid is the fallback). Don't switch plans yourself.
+  - Check that `/api/manifest/IDR503` and `/api/series/IDR504/<today>` keep accumulating, and that the app still loads.
+
+---
+
 ### Task 15: "Rain at home" series recorded at ingest (runs after Task 11, before Task 12)
 
 This feeds the zoomed-out tape (spec §6.2). Execution order: … 11 → **15** → 12 → 13 → 14.
@@ -696,3 +805,11 @@ This feeds the zoomed-out tape (spec §6.2). Execution order: … 11 → **15** 
 - [ ] **Step 2:** Run the tests. Expected: FAIL.
 - [ ] **Step 3:** Implement. In `runIngest`, geometry must be available before frames: use stored meta, refreshed hourly. Compute each tape-product frame's home level **before** its `put` and attach it as `customMetadata`. If sampling fails, put the frame without metadata and record the error. `homePixel` uses the pixel-centre convention `x = u·512 − 0.5` (matching the shader). The disc max must sample at native cell centres using `CELL_SIZE[product]`, so a lone 2×2 cell reads its full value. **CPU (free plan):** in the Worker, don't run a full `fast-png` decode. Inflate the IDAT stream with the native `DecompressionStream("deflate")` and un-filter only the rows needed to reach `y + rPx`, then classify just the disc's pixels. Keep `maxLevelInDisc` working on a `LevelField` for the browser, and add `sampleHomeFromPng(png, geom)` for the Worker, both sharing one disc routine. Test that `sampleHomeFromPng` equals `maxLevelInDisc(decodeFrame(png))` on both real fixtures (4-bit and 8-bit). Catch series errors into `report.errors`; they never block frames or the manifest.
 - [ ] **Step 4:** Run `npm test`. Expected: PASS. Then run `npm run deploy` and `npx wrangler tail rain-radar --format json` over ≥ 6 cron runs, and record `cpuTime`. If any steady-state run exceeds 10 ms, lower `maxDownloads` to 3 and recheck. If it's still over, **stop and ask the user** (Workers Paid decision). Then `curl /api/series/IDR504/<today>`. Expected: points accumulating.
+
+### Task 21: Workers Paid, all eight products, one simple ingest (supersedes Task 20)
+
+User, 2026-10-28: upgraded to Workers Paid; "forget all the minimising stuff and just have one worker that runs every minute and does all the things it needs to. Add back in the other radar sizes."
+
+- Restored `IDR501/502/661/662` (config, pickRange, map minZoom, `FrameStore.startProduct`, `radarGlob` `[1-4]`, tests and fixtures all back to their pre-Task-20 state).
+- One cron `* * * * *`. `scheduled` runs Marburg and Mt Stapylton in parallel (`Promise.all`), each on its own FTP connection, with one combined NLST per radar. Every missing in-window frame is downloaded (no caps), and the tape products' home level is sampled inline and stored as `customMetadata` in the same put. A failing radar does not stop the other. One log line per run.
+- Removed Task 20's due/resync/pendingHome/missing scheduling and the `*/1` second trigger. Kept: per-radar `state/{radar}.json` (`newest`, `lastOk`, `lastError`), hourly meta refresh, and the cheaper `sampleHomeFromPng`.
