@@ -161,6 +161,10 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
       const graphH = h - LABEL_H;
       const cols = Math.max(1, Math.round(w)), colW = w / cols, colMs = span / cols;
       const p = tapeProduct();
+      // The tape product's own newest frame. It trails `end` when the map shows a finer range, which
+      // publishes a couple of minutes ahead; the nowcast (built from this frame) fills that gap.
+      const pFrames = p ? store.frames(p) : [];
+      const dataEnd = pFrames.length ? pFrames[pFrames.length - 1]! : end;
 
       let levels: Float32Array = new Float32Array(cols).fill(NaN);
       if (p && span <= SERIES_SOURCE_SWITCH_MS) {
@@ -170,11 +174,11 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
         levels = seriesToColumns(dayPoints(p, from - colMs, Math.min(to, end) + colMs), from, to, cols);
       }
       // Nowcast columns, at any span.
-      const geom = p && to > end ? store.geometry(p) : null;
+      const geom = p && to > dataEnd ? store.geometry(p) : null;
       const fc = p && geom ? buildHomeForecast(store, p, geom) : null;
       for (let c = 0; c < cols; c++) {
         const tc = from + (c + 0.5) * colMs;
-        if (tc > end) levels[c] = fc ? homeLevel(fc, tc) : NaN;
+        if (tc > dataEnd) levels[c] = fc ? homeLevel(fc, tc) : NaN;
       }
 
       // The nowcast section's tint, under the graph.
