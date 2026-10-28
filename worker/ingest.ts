@@ -1,5 +1,7 @@
 import { MANIFEST_SPAN_MS, PRODUCTS, RADARS, type ProductId } from "../shared/config";
+import { sampleHomeFromPng } from "../shared/homeSample";
 import { msToStamp, stampToMs } from "../shared/stamps";
+import type { RadarGeometry } from "../shared/types";
 import type { FtpSource } from "./ftpProtocol";
 import { parseListing } from "./listing";
 import { parseMapFile } from "./mapFile";
@@ -27,17 +29,22 @@ const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** A glob matching nothing may surface as an FTP 450/550 rather than an empty list. */
 const isNoFiles = (e: unknown) => /\b[45]50\b/.test(msg(e));
 
-async function fetchMeta(ftp: FtpSource, bucket: BucketLike, product: ProductId, nowMs: number) {
+/** Stored meta is the geometry plus `fetchedAt`; anything without corners is treated as no geometry. */
+const asGeometry = (m: Partial<RadarGeometry> | null): RadarGeometry | null => (m?.corners ? (m as RadarGeometry) : null);
+
+/** Refreshes `meta/{product}.json` when missing or stale and returns the geometry, if there is one. */
+async function fetchMeta(ftp: FtpSource, bucket: BucketLike, product: ProductId, nowMs: number): Promise<RadarGeometry | null> {
   const key = `meta/${product}.json`;
   const existing = await bucket.get(key);
   if (existing) {
-    const { fetchedAt } = (await existing.json()) as { fetchedAt?: string };
-    const age = nowMs - Date.parse(fetchedAt ?? "");
-    if (age >= 0 && age < META_MAX_AGE_MS) return;
+    const meta = (await existing.json()) as Partial<RadarGeometry> & { fetchedAt?: string };
+    const age = nowMs - Date.parse(meta.fetchedAt ?? "");
+    if (age >= 0 && age < META_MAX_AGE_MS) return asGeometry(meta);
   }
   const bytes = await ftp.retrieve(`${MAP_DIR}/${product}.map`);
   const geometry = parseMapFile(new TextDecoder().decode(bytes));
   await bucket.put(key, JSON.stringify({ ...geometry, fetchedAt: new Date(nowMs).toISOString() }));
+  return geometry;
 }
 
 /** Stamps already stored in R2 after `afterStamp` (a plain key listing, no JSON). */
@@ -132,6 +139,20 @@ export async function runIngest(deps: {
     const listedNewest = listed[listed.length - 1];
     let fetched = 0;
 
+    // The tape product's frames carry the rain level at home, which needs the geometry before the first put.
+    const isTape = product === RADARS[radar].tapeProduct;
+    let geometry: RadarGeometry | null = null;
+    if (isTape) {
+      try {
+        if (refreshMeta) geometry = await fetchMeta(ftp, bucket, product, nowMs);
+        else if (listedNewest && (!known || listedNewest > known)) {
+          geometry = asGeometry((await (await bucket.get(`meta/${product}.json`))?.json()) as Partial<RadarGeometry> | null);
+        }
+      } catch (e) {
+        metaError = `meta: ${msg(e)}`;
+      }
+    }
+
     if (!frameError && listedNewest && (!known || listedNewest > known)) {
       try {
         const todo = listed.filter((s) => (!known || s > known) && stampToMs(s) >= cutoff).reverse(); // newest first
@@ -142,7 +163,18 @@ export async function runIngest(deps: {
         }
         for (const stamp of missing.slice(0, perProductCap)) {
           const bytes = await ftp.retrieve(`/anon/gen/radar/${product}.T.${stamp}.png`);
-          await bucket.put(`frames/${product}/${stamp}.png`, bytes, { httpMetadata: { contentType: "image/png" } });
+          let customMetadata: Record<string, string> | undefined;
+          if (geometry) {
+            try {
+              customMetadata = { home: String(await sampleHomeFromPng(bytes, geometry)) };
+            } catch (e) {
+              report.errors.push(`${product}: home sample ${stamp}: ${msg(e)}`);
+            }
+          }
+          await bucket.put(`frames/${product}/${stamp}.png`, bytes, {
+            httpMetadata: { contentType: "image/png" },
+            ...(customMetadata ? { customMetadata } : {}),
+          });
           fetched++;
         }
         if (fetched === missing.length && todo.length > 0) {
@@ -155,7 +187,7 @@ export async function runIngest(deps: {
     }
     report.added[product] = fetched;
 
-    if (refreshMeta) {
+    if (refreshMeta && !isTape) {
       try {
         await fetchMeta(ftp, bucket, product, nowMs);
       } catch (e) {

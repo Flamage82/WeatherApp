@@ -1,29 +1,41 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 // MapLibre finds its worker relative to its own module URL, which Vite's dep pre-bundling moves;
 // point it at the (self-contained) worker file explicitly. Works in dev and in the build.
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
-import { HOME, type ProductId } from "../../shared/config";
+import { HOME } from "../../shared/config";
 import { decodeFrame } from "../../shared/decodeFrame";
+import { Clock } from "../controls/Clock";
+import { Legend } from "../controls/Legend";
+import { stepDetent } from "../controls/leverMath";
+import { PlayButton } from "../controls/PlayButton";
+import { SpeedLever } from "../controls/SpeedLever";
+import { StatusBar } from "../controls/StatusBar";
+import { useKeyboard } from "../controls/useKeyboard";
 import { fetchDay, fetchEarliest, fetchFrame, fetchManifest, fetchMeta } from "../data/api";
+import type { RadarName } from "../data/chooseRadar";
 import { createFlowClient } from "../data/flowClient";
 import { FrameStore } from "../data/frameStore";
 import type { RadarLayer } from "../render/radarLayer";
+import { Tape } from "../tape/Tape";
+import { DEFAULT_SPAN_MS } from "../tape/tapeMath";
+import { loopWindow, stepPlayback, type PlayState } from "../time/timeline";
 import { RadarView } from "./radarView";
 
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
 
 const STYLE_LIGHT = "https://tiles.openfreemap.org/styles/positron";
 const STYLE_DARK = "https://tiles.openfreemap.org/styles/dark";
-const BOM_ATTRIBUTION = "Radar data © Commonwealth of Australia, Bureau of Meteorology";
+/** The clock's "−N min" and the status bar's "updated N min ago" are refreshed this often. */
+const NOW_TICK_MS = 10_000;
 
-/** Playhead this close to the start of what's loaded → load further back (spec §6.4). */
+/** The tape's left edge this close to the start of what's loaded → load further back (spec §6.4). */
 const EXTEND_MARGIN_MS = 20 * 60_000;
 const EXTEND_STEP_MS = 60 * 60_000;
 /** `ensureAround` is throttled to this while the playhead moves. */
 const ENSURE_THROTTLE_MS = 500;
-/** A playhead this close to the newest frame is live: it follows new frames (Task 13 uses the same). */
+/** A playhead this close to the newest frame is live: it follows new frames (spec §6.4). */
 const LIVE_MS = 30_000;
 
 // Spec §7.1: dark by default; light only when the system explicitly asks for it.
@@ -50,25 +62,32 @@ function addRadarLayer(map: maplibregl.Map, layer: RadarLayer) {
 }
 
 type Ui = {
-  start: number;
-  end: number;
   t: number;
   live: boolean;
-  radar: string;
-  status: string;
-  product: ProductId | null;
+  radar: RadarName | null;
+  status: FrameStore["status"];
+  newestMs: number | null;
 };
-
-const fmtTime = (ms: number) =>
-  new Intl.DateTimeFormat("en-AU", {
-    timeZone: "Australia/Brisbane", weekday: "short", hour: "numeric", minute: "2-digit", hour12: true,
-  }).format(ms);
 
 export function RadarScreen() {
   const containerRef = useRef<HTMLDivElement>(null);
   const storeRef = useRef<FrameStore | null>(null);
   const viewRef = useRef<RadarView | null>(null);
+  const [store, setStore] = useState<FrameStore | null>(null);
   const [ui, setUi] = useState<Ui | null>(null);
+  const [spanMs, setSpanMs] = useState(DEFAULT_SPAN_MS);
+  const spanRef = useRef(spanMs);
+  spanRef.current = spanMs;
+  // Playback: `play.t` is the playhead while playing; `win` is the loop window (spec §6.4).
+  const play = useRef<PlayState>({ t: 0, speed: 0, lastSpeed: 1, holdMs: 0 });
+  const win = useRef({ start: 0, end: 0 });
+  const [speed, setSpeedUi] = useState(0);
+  const [now, setNow] = useState(Date.now);
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), NOW_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current!;
@@ -78,7 +97,10 @@ export function RadarScreen() {
       style: styleFor(mq.matches),
       center: [HOME.lon, HOME.lat],
       zoom: 9,
-      attributionControl: { compact: true, customAttribution: BOM_ATTRIBUTION },
+      // The status bar carries both attributions (MapLibre's control opens expanded over the tape on phones).
+      attributionControl: false,
+      // Arrow keys step time (useKeyboard), so the map doesn't pan with them.
+      keyboard: false,
     });
     new maplibregl.Marker({ color: "#e11d48" }).setLngLat([HOME.lon, HOME.lat]).addTo(map);
 
@@ -92,15 +114,22 @@ export function RadarScreen() {
     const view = new RadarView(map, store, (l) => addRadarLayer(map, l), () => publish());
     storeRef.current = store;
     viewRef.current = view;
+    setStore(store);
 
     function publish() {
-      const w = store.loadedWindow();
-      setUi({
-        start: w.start, end: w.end, t: view.time(), live: view.isLive(),
-        radar: store.radar ?? "…", status: store.status, product: view.product,
-      });
+      setUi({ t: view.time(), live: view.isLive(), radar: store.radar, status: store.status, newestMs: store.newestMs });
     }
+    // While playing, new frames extend the loop window if it ended at the newest frame, and a playhead
+    // at the newest frame follows them. (Paused, a live view follows by itself.)
+    let newest = store.loadedWindow().end;
     const onChange = () => {
+      const end = store.loadedWindow().end;
+      const p = play.current;
+      if (end > newest && p.speed !== 0) {
+        if (win.current.end >= newest) win.current = { ...win.current, end };
+        if (Math.abs(p.t - newest) <= LIVE_MS) play.current = { ...p, t: end };
+      }
+      newest = end;
       view.onStoreChange();
       publish();
     };
@@ -132,12 +161,13 @@ export function RadarScreen() {
       view.dispose();
       map.remove();
       storeRef.current = viewRef.current = null;
+      setStore(null);
     };
   }, []);
 
-  // TEMP (Task 12): the tape replaces this time control; it reuses the same store calls.
+  // Moving the playhead (scrubbing, keys, playback) moves the view and the decode window.
   const lastEnsure = useRef(0);
-  const onScrub = (v: number) => {
+  const applyTime = useCallback((v: number) => {
     const store = storeRef.current, view = viewRef.current;
     if (!store || !view) return;
     const w = store.loadedWindow();
@@ -153,10 +183,70 @@ export function RadarScreen() {
         store.ensureAround(v);
       }
     }
-    if (v - w.start < EXTEND_MARGIN_MS) store.extendBack(w.start - EXTEND_STEP_MS);
+    // Keep stamps known back past the tape's visible left edge, so it can keep scrolling (no 24 h limit).
+    const edge = v - spanRef.current / 2;
+    if (edge - w.start < EXTEND_MARGIN_MS) store.extendBack(Math.min(w.start, edge) - EXTEND_STEP_MS);
     setUi((u) => (u ? { ...u, t: view.time(), live } : u));
+  }, []);
+
+  /** The loop window around `t` (spec §6.4), with its stamps requested if it starts before what's loaded. */
+  const loopAround = (t: number) => {
+    const store = storeRef.current!;
+    const w = store.loadedWindow();
+    win.current = loopWindow(t, w.end);
+    if (win.current.start < w.start) store.extendBack(win.current.start);
   };
-  // TEMP (Task 12): trailing ensureAround once the control rests, so the final position is loaded
+
+  // A user move (tape or keys; already clamped to the loaded window). While playing, playback carries
+  // on from there in a new loop window.
+  const onScrub = (v: number) => {
+    applyTime(v);
+    if (play.current.speed !== 0) {
+      play.current = { ...play.current, t: v, holdMs: 0 };
+      loopAround(v);
+    }
+  };
+
+  const setSpeed = (s: number) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const p = play.current;
+    if (p.speed === 0 && s !== 0) {
+      // Play pressed: the loop window is fixed around the playhead.
+      play.current = { ...p, t: view.time(), holdMs: 0 };
+      loopAround(view.time());
+    }
+    play.current = { ...play.current, speed: s, lastSpeed: s !== 0 ? s : p.lastSpeed };
+    setSpeedUi(s);
+  };
+  const togglePlay = () => setSpeed(play.current.speed === 0 ? play.current.lastSpeed : 0);
+
+  const playing = speed !== 0;
+  useEffect(() => {
+    if (!playing) return;
+    let raf = 0, last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.max(0, now - last);
+      last = now;
+      play.current = stepPlayback(play.current, dt, win.current);
+      applyTime(play.current.t);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, applyTime]);
+
+  useKeyboard({
+    togglePlay,
+    step: (d) => {
+      const store = storeRef.current, view = viewRef.current;
+      if (!store || !view) return;
+      const { start, end } = store.loadedWindow();
+      onScrub(Math.min(Math.max(view.time() + d, start), end));
+    },
+    stepSpeed: (dir) => setSpeed(stepDetent(play.current.speed, dir)),
+  });
+  // Trailing ensureAround once the playhead rests, so the final position is loaded
   // (null when it rests at live, so the window keeps following the newest frame).
   useEffect(() => {
     if (!ui) return;
@@ -167,27 +257,36 @@ export function RadarScreen() {
   return (
     <div style={{ position: "fixed", inset: 0 }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
-      {/* TEMP (Task 12): scaffold time control over the loaded window, replaced by the tape and lever. */}
-      {ui && (
-        <label
+      {ui && <Clock t={ui.t} now={now} />}
+      {/* The lever, centred in the space between the clock and the controls (at most 240 px tall). */}
+      <div
+        style={{
+          position: "absolute", right: 12, top: "calc(76px + env(safe-area-inset-top))",
+          bottom: "calc(200px + env(safe-area-inset-bottom))", maxHeight: 240, margin: "auto 0",
+        }}
+      >
+        <SpeedLever speed={speed} onChange={setSpeed} />
+      </div>
+      {store && ui && (
+        <div
           style={{
-            position: "absolute", top: 8, left: 8, right: 8, maxWidth: 560, padding: "6px 10px", borderRadius: 6,
-            background: "rgba(0,0,0,0.6)", color: "#fff", font: "12px system-ui, sans-serif",
-            display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, boxSizing: "border-box",
+            position: "absolute", left: 0, right: 0, bottom: 0,
+            padding: "24px 8px calc(6px + env(safe-area-inset-bottom))",
+            background: "linear-gradient(transparent, rgba(5,8,12,0.85) 24px)",
           }}
         >
-          <input
-            type="range" min={ui.start} max={ui.end} step={10_000} value={ui.live ? ui.end : ui.t}
-            aria-label="time (temporary)" style={{ flex: "1 1 200px", minWidth: 0 }}
-            onChange={(e) => onScrub(Number(e.target.value))}
-          />
-          <span data-testid="radar-time" style={{ minWidth: 96 }}>
-            {fmtTime(ui.t)}{ui.live ? " (live)" : ""}
-          </span>
-          <span data-testid="radar-status" style={{ opacity: 0.7 }}>
-            {ui.radar} · {ui.status} · {ui.product ?? "…"} · from {fmtTime(ui.start)}
-          </span>
-        </label>
+          {/* Positioned, so the open legend sits above the tape. */}
+          <div style={{ position: "relative", maxWidth: 720, margin: "0 auto", display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ borderRadius: 8, overflow: "hidden", background: "rgba(0,0,0,0.6)" }}>
+              <Tape store={store} t={ui.t} spanMs={spanMs} onScrub={onScrub} onSpanChange={setSpanMs} />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center" }}>
+              <div style={{ justifySelf: "start" }}><Legend /></div>
+              <PlayButton playing={playing} onToggle={togglePlay} />
+            </div>
+            <StatusBar status={ui.status} radar={ui.radar} newestMs={ui.newestMs} now={now} />
+          </div>
+        </div>
       )}
     </div>
   );

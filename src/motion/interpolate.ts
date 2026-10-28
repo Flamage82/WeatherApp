@@ -42,15 +42,24 @@ export function sampleInterpolated(
   return Math.min((1 - alpha) * wa + alpha * wb, Math.max(wa, wb));
 }
 
-/** Maximum sampleInterpolated over integer pixel positions within radius rPx of (cx, cy). */
+/**
+ * Maximum sampleInterpolated over the native cell centres (pixel k*c + (k-1)/2) within radius rPx of
+ * (cx, cy), cells inside the frame only: the same cells `maxLevelInDisc` reads, so at a frame's own time
+ * (alpha 0, or 1 on B) both give the same value. With k = 1 the centres are the integer pixels.
+ */
 export function sampleInterpolatedMaxInDisc(
   a: LevelField, b: LevelField, f: FlowField, alpha: number, cx: number, cy: number, rPx: number,
   cell: CellSize = 1,
 ): number {
   let m = 0;
   const r2 = rPx * rPx;
-  for (let y = Math.ceil(cy - rPx); y <= Math.floor(cy + rPx); y++)
-    for (let x = Math.ceil(cx - rPx); x <= Math.floor(cx + rPx); x++)
+  const h = (cell - 1) / 2, last = 512 / cell - 1;
+  const c0 = (p: number) => Math.max(0, Math.ceil((p - rPx - h) / cell));
+  const c1 = (p: number) => Math.min(last, Math.floor((p + rPx - h) / cell));
+  for (let qy = c0(cy); qy <= c1(cy); qy++)
+    for (let qx = c0(cx); qx <= c1(cx); qx++) {
+      const x = qx * cell + h, y = qy * cell + h;
       if ((x - cx) ** 2 + (y - cy) ** 2 <= r2) m = Math.max(m, sampleInterpolated(a, b, f, alpha, x, y, cell));
+    }
   return m;
 }

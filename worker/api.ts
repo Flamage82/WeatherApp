@@ -1,6 +1,6 @@
 import { MANIFEST_SPAN_MS, PRODUCTS, RADARS, type ProductId } from "../shared/config";
 import { msToStamp, stampToMs } from "../shared/stamps";
-import type { Manifest } from "../shared/types";
+import type { Manifest, SeriesDay } from "../shared/types";
 
 export type ApiBucket = Pick<R2Bucket, "get" | "list">;
 
@@ -128,6 +128,25 @@ export async function handleApi(req: Request, bucket: ApiBucket, nowMs: number):
       } while (cursor);
       frames.sort();
       return json({ product, day: arg, frames }, 200, dayCache);
+    }
+    case "series": {
+      // Rain level at home per frame, recorded at ingest as `home` custom metadata on the frame object.
+      if (!arg || !/^\d{8}$/.test(arg)) return notFound();
+      const dayCache = dayCacheControl(arg, nowMs);
+      if (!dayCache) return notFound();
+      const prefix = `frames/${product}/${arg}`;
+      const points: SeriesDay["points"] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await bucket.list({ prefix, cursor, include: ["customMetadata"] });
+        for (const o of page.objects) {
+          const home = o.customMetadata?.home;
+          if (home !== undefined) points.push([o.key.slice(-16, -4), Number(home)]);
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      points.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+      return json({ product, day: arg, points }, 200, dayCache);
     }
     default:
       return notFound();

@@ -114,10 +114,11 @@ describe("native cell size", () => {
     }
   });
 
-  it("max in disc passes the cell size through", () => {
+  it("max in disc samples at cell centres (as maxLevelInDisc does)", () => {
     const f = cells2((cx) => (cx === 100 ? 12 : 0));
-    // Pixel 200.5 is cell 100's centre; integer pixels 200 and 201 sit a quarter of the way off it.
-    expect(sampleInterpolatedMaxInDisc(f, f, ZERO_FLOW, 0, 200, 50, 1, 2)).toBeCloseTo(9, 12);
-    expect(sampleInterpolatedMaxInDisc(f, f, ZERO_FLOW, 0, 200, 50, 1, 1)).toBe(12);
+    // Pixel 200.5 is cell 100's centre, 0.5 px from x = 200: inside a 0.6 px disc, read in full.
+    expect(sampleInterpolatedMaxInDisc(f, f, ZERO_FLOW, 0, 200, 50.5, 0.6, 2)).toBe(12);
+    // A 0.4 px disc holds no cell centre at all.
+    expect(sampleInterpolatedMaxInDisc(f, f, ZERO_FLOW, 0, 200, 50.5, 0.4, 2)).toBe(0);
   });
 });
