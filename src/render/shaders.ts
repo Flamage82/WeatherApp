@@ -1,6 +1,4 @@
-import { NOWCAST_MAX_MS } from "../../shared/config";
 import { MAX_NOWCAST_STEPS, NOWCAST_STEP_MS, RELAX_MS } from "../motion/advect";
-import { FORECAST_MIN_OPACITY } from "../motion/interpolate";
 import { DATA_MARGIN_PX } from "../motion/nest";
 
 /**
@@ -8,7 +6,7 @@ import { DATA_MARGIN_PX } from "../motion/nest";
  *
  * INTERP_GLSL is a line-for-line port of `src/motion/nest.ts` `edgeDist`, `edgeWeight` and
  * `nestSlotSample` (as `nestSlot`), `src/motion/advect.ts` `advectBack` and `nowcastVelocity`,
- * `src/motion/interpolate.ts` `bilinear` and `forecastOpacity`, and `src/motion/flow.ts` `flowAt`.
+ * `src/motion/interpolate.ts` `bilinear`, and `src/motion/flow.ts` `flowAt`.
  * Both bilinear lookups are done by hand with `texelFetch`, not hardware filtering:
  *  - level textures (R8UI): out-of-bounds taps read 0 exactly, which WebGL2 can't express with
  *    wrap modes (no clamp-to-border), and the tap positions match the CPU (value at integer coords);
@@ -105,11 +103,6 @@ vec4 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
   return (v00 * (1.0 - f.x) + v10 * f.x) * (1.0 - f.y) + (v01 * (1.0 - f.x) + v11 * f.x) * f.y;
 }
 
-// interpolate.ts forecastOpacity: 1 at lead 0, fading linearly to FORECAST_MIN_OPACITY at NOWCAST_MAX_MS.
-float forecastOpacity(float leadMs) {
-  return 1.0 - ${(1 - FORECAST_MIN_OPACITY).toFixed(4)} * clamp(leadMs / ${NOWCAST_MAX_MS.toFixed(1)}, 0.0, 1.0);
-}
-
 // nest.ts edgeDist: px inside the data area (the frame minus its no-data border), from pixel edges;
 // negative outside.
 float edgeDist(vec2 p) {
@@ -182,7 +175,7 @@ const perSlot = (f: (i: number) => string) => Array.from({ length: SHADER_SLOTS 
  * Per slot i: gnomonic tangent point (radians), image extent in tangent-plane units, the A/B level
  * textures, the A->B flow texture and the blend position alpha; or, with u_lead > 0, the nowcast:
  * A = the newest frame, the flow texture = the motion field (px/ms in the motion grid, mapped by
- * u_maff), drawn faded with lead time. u_band = edge blend band (BLEND_PX), u_on = 0 absent,
+ * u_maff), drawn like any other frame. u_band = edge blend band (BLEND_PX), u_on = 0 absent,
  * 1 fresh, 2 stale (drawn only where no fresh slot has data, the finest first).
  */
 export const FRAGMENT_SHADER = /* glsl */ `#version 300 es
@@ -233,28 +226,27 @@ void main() {
   vec2 lonLat = vec2(v_merc.x * 2.0 * PI - PI, atan(sinh(PI * (1.0 - 2.0 * v_merc.y))));
   // nest.ts sampleNested: fresh slots blend by weight, c = rem*w; the finest stale slot with data
   // is the fallback where no fresh slot has any. Once rem reaches 0 nothing coarser can show.
-  float rem = 1.0, level = 0.0, opSum = 0.0, cSum = 0.0;
+  float rem = 1.0, level = 0.0, cSum = 0.0;
   bool stale = false;
-  float staleLevel = 0.0, staleOp = 0.0;
+  float staleLevel = 0.0;
 ${perSlot((i) => `  if (rem > 0.0 && (u_on${i} == 1 || (u_on${i} == 2 && !stale))) {
     vec2 r = nestSlot(u_a${i}, u_b${i}, u_flow${i}, u_flowSize${i}, u_alpha${i}, u_lead${i},
                       gnomonicUV(lonLat, u_centre${i}, u_extent${i}) * 512.0 - 0.5, u_cell${i}, u_band${i}, u_maff${i});
     if (r.y > 0.0) {
-      float op = forecastOpacity(u_lead${i});
       if (u_on${i} == 2) {
-        stale = true; staleLevel = r.x; staleOp = op;
+        stale = true; staleLevel = r.x;
       } else {
         float c = rem * r.y;
-        level += c * r.x; opSum += c * op; cSum += c;
+        level += c * r.x; cSum += c;
         rem *= 1.0 - r.y;
       }
     }
   }`)}
-  float opacity = 0.0;
-  if (cSum > 0.0) opacity = opSum / cSum;
-  else if (stale) { level = staleLevel; opacity = staleOp; }
-  else discard;
-  vec4 col = opacity * ramp(level);
+  if (cSum <= 0.0) {
+    if (stale) level = staleLevel;
+    else discard;
+  }
+  vec4 col = ramp(level);
   if (col.a <= 0.0) discard;
   fragColor = col;
 }

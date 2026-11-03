@@ -3,7 +3,7 @@ import type { LevelField } from "../../shared/decodeFrame";
 import type { PixelAffine } from "../../shared/gnomonic";
 import { advectBack } from "./advect";
 import { flowAt, type FlowField } from "./flow";
-import { bilinear, forecastOpacity } from "./interpolate";
+import { bilinear } from "./interpolate";
 
 /**
  * A kept pair counts as data only while the drawn time is within one frame interval of it (spec §4.3).
@@ -67,33 +67,28 @@ export function nestSlotSample(s: NestSlot, x: number, y: number): { level: numb
 
 /**
  * Combine slots, finest first; `ps[i]` is the point in slot i's px. Fresh slots blend by weight:
- * c = rem·w, level = Σ c·L, opacity = Σ c·forecastOpacity(lead) / Σ c, rem *= 1 − w. Where no fresh slot
- * has data, the finest stale one is drawn so scrubbing into undecoded frames never blanks the map.
- * Null where nothing covers the point.
+ * c = rem·w, level = Σ c·L, rem *= 1 − w. A nowcast is drawn like any other frame, at full opacity.
+ * Where no fresh slot has data, the finest stale one is drawn so scrubbing into undecoded frames never
+ * blanks the map. Null where nothing covers the point.
  */
-export function sampleNested(
-  slots: NestSlot[], ps: { x: number; y: number }[],
-): { level: number; opacity: number } | null {
-  let rem = 1, level = 0, opSum = 0, cSum = 0;
-  let stale: { level: number; opacity: number } | null = null;
+export function sampleNested(slots: NestSlot[], ps: { x: number; y: number }[]): number | null {
+  let rem = 1, level = 0, cSum = 0;
+  let stale: number | null = null;
   for (let i = 0; i < slots.length; i++) {
     const s = slots[i]!;
     const { level: l, weight: w } = nestSlotSample(s, ps[i]!.x, ps[i]!.y);
     if (w <= 0) continue;
-    const op = forecastOpacity(s.leadMs);
     if (!s.fresh) {
-      stale ??= { level: l, opacity: op };
+      stale ??= l;
       continue;
     }
     const c = rem * w;
     level += c * l;
-    opSum += c * op;
     cSum += c;
     rem *= 1 - w;
     if (rem <= 0) break;
   }
-  if (cSum > 0) return { level, opacity: opSum / cSum };
-  return stale;
+  return cSum > 0 ? level : stale;
 }
 
 export function isFresh(pair: { fromMs: number; toMs: number }, t: number): boolean {

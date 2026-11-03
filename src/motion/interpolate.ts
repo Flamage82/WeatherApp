@@ -1,4 +1,4 @@
-import { NOWCAST_MAX_MS, type CellSize } from "../../shared/config";
+import type { CellSize } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import { advectBack } from "./advect";
 import { flowAt, type FlowField } from "./flow";
@@ -54,13 +54,6 @@ export function sampleForecast(
 ): number {
   const [sx, sy] = advectBack(v, x, y, leadMs);
   return bilinear(a, sx, sy, cell);
-}
-
-/** Opacity of the nowcast at `leadMs`: 1 at the newest frame, fading linearly to this at NOWCAST_MAX_MS. */
-export const FORECAST_MIN_OPACITY = 0.55;
-
-export function forecastOpacity(leadMs: number): number {
-  return 1 - (1 - FORECAST_MIN_OPACITY) * Math.min(1, Math.max(0, leadMs / NOWCAST_MAX_MS));
 }
 
 /** Max of `sample(x, y)` over the native cell centres (pixel k*c + (k-1)/2) within rPx of (cx, cy), inside the frame. */

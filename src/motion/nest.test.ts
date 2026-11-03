@@ -84,14 +84,14 @@ describe("sampleNested", () => {
   const mid = { x: 256, y: 256 };
 
   it("shows the finest level in the interior and blends 50/50 halfway through the band", () => {
-    expect(sampleNested([fine(), coarse()], [mid, mid])).toEqual({ level: 8, opacity: 1 });
+    expect(sampleNested([fine(), coarse()], [mid, mid])).toBe(8);
     const edge = sampleNested([fine(), coarse()], [{ x: 25.5, y: 256 }, mid])!; // edgeDist 10
-    expect(edge.level).toBeCloseTo(0.5 * 8 + 0.5 * 2, 12);
+    expect(edge).toBeCloseTo(0.5 * 8 + 0.5 * 2, 12);
   });
 
   it("skips a stale slot while a fresh one has data, but falls back to the finest stale one", () => {
-    expect(sampleNested([fine({ fresh: false }), coarse()], [mid, mid])!.level).toBe(2);
-    expect(sampleNested([fine({ fresh: false }), coarse({ fresh: false })], [mid, mid])!.level).toBe(8);
+    expect(sampleNested([fine({ fresh: false }), coarse()], [mid, mid])).toBe(2);
+    expect(sampleNested([fine({ fresh: false }), coarse({ fresh: false })], [mid, mid])).toBe(8);
   });
 
   it("is null where nothing covers the point", () => {

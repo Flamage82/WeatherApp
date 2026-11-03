@@ -81,7 +81,7 @@ export function buildHomeForecast(
       affines.push(affine);
     }
     values[k] = maxInDisc(x, y, rPx, first.cell, (px, py) =>
-      sampleNested(slots, affines.map((m) => ({ x: m.sx * px + m.ox, y: m.sy * py + m.oy })))?.level ?? 0);
+      sampleNested(slots, affines.map((m) => ({ x: m.sx * px + m.ox, y: m.sy * py + m.oy }))) ?? 0);
   }
   const h = { fromMs, values };
   forecastMemo.set(first.flow, { key, h });

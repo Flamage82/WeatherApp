@@ -3,7 +3,6 @@ import { NOWCAST_MAX_MS, type ProductId } from "../../shared/config";
 import { samplePointFromPng } from "../../shared/homeSample";
 import { fetchFrame } from "../data/api";
 import type { FrameStore } from "../data/frameStore";
-import { forecastOpacity } from "../motion/interpolate";
 import { MAX_LEVEL, rampColour } from "../render/colourRamp";
 import { buildHomeForecast, buildHomeSeries } from "./homeSeries";
 import { LongSeries } from "./longSeries";
@@ -77,7 +76,7 @@ type Props = {
  * (cached) frame PNGs (`LongSeries`). Where there's no value yet the tape shows a faint hatch, drifting
  * while long-span frames are still loading. Past the newest frame ("now") comes the nowcast, up to
  * NOWCAST_MAX_MS: a tinted section whose graph is the client nowcast at the location (`buildHomeForecast`,
- * at any span), faded as the map fades it. Beyond that the tape is shaded.
+ * at any span), drawn at full opacity like the map. Beyond that the tape is shaded.
  */
 export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -184,8 +183,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
         if (v <= 0) continue;
         const [r, g, b, a] = rampColour(v);
         const bar = Math.max(1, (Math.min(v, MAX_LEVEL) / MAX_LEVEL) * graphH);
-        const fade = tc > end ? forecastOpacity(tc - end) : 1;
-        ctx.fillStyle = `rgba(${r},${g},${b},${(a / 255) * fade})`;
+        ctx.fillStyle = `rgba(${r},${g},${b},${a / 255})`;
         ctx.fillRect(c * colW, graphH - bar, colW + 0.5, bar);
       }
       flushHatch(cols);
