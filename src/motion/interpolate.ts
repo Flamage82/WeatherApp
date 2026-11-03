@@ -1,5 +1,6 @@
 import { NOWCAST_MAX_MS, type CellSize } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
+import { advectBack } from "./advect";
 import { flowAt, type FlowField } from "./flow";
 
 /**
@@ -44,15 +45,15 @@ export function sampleInterpolated(
 
 /**
  * Nowcast level at full-res pixel p = (x, y), `leadMs` past frame A (the newest frame), with `v` from
- * `forecastFlow` (px per ms). Semi-Lagrangian backward advection at constant velocity; the shader
- * reproduces exactly this:
- *   V = flowAt(v, x, y);   result = A(p - leadMs*V)   (cell bilinear, out-of-bounds = 0)
+ * `forecastFlow` (px per ms). Semi-Lagrangian backward advection in 5-minute steps through a motion that
+ * eases to the large-scale field (`advectBack`); the shader reproduces exactly this:
+ *   S = advectBack(v, x, y, leadMs);   result = A(S)   (cell bilinear, out-of-bounds = 0)
  */
 export function sampleForecast(
   a: LevelField, v: FlowField, leadMs: number, x: number, y: number, cell: CellSize = 1,
 ): number {
-  const [vx, vy] = flowAt(v, x, y);
-  return bilinear(a, x - leadMs * vx, y - leadMs * vy, cell);
+  const [sx, sy] = advectBack(v, x, y, leadMs);
+  return bilinear(a, sx, sy, cell);
 }
 
 /** Opacity of the nowcast at `leadMs`: 1 at the newest frame, fading linearly to this at NOWCAST_MAX_MS. */

@@ -68,6 +68,14 @@ describe("nestSlotSample", () => {
     expect(hit.weight).toBe(1);
     expect(nestSlotSample(s, 180.5, 100.5).level).toBe(0);
   });
+
+  it("integrates through the motion affine across several steps", () => {
+    const a = field((cx, cy) => (cx === 90 && cy === 50 ? 10 : 0)); // cell centre at pixel (180.5, 100.5)
+    const s = slot({ a, flow: uniformFlow(1 / 60_000, 0), leadMs: 1_200_000, motion: { sx: 0.5, ox: 128, sy: 0.5, oy: 128 } });
+    // 20 min × 1/60_000 motion px/ms = 20 motion px = 40 slot px
+    expect(nestSlotSample(s, 220.5, 100.5).level).toBeCloseTo(10, 3);
+    expect(nestSlotSample(s, 180.5, 100.5).level).toBe(0);
+  });
 });
 
 describe("sampleNested", () => {

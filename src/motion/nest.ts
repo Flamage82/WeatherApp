@@ -1,6 +1,7 @@
 import type { CellSize } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import type { PixelAffine } from "../../shared/gnomonic";
+import { advectBack } from "./advect";
 import { flowAt, type FlowField } from "./flow";
 import { bilinear, forecastOpacity } from "./interpolate";
 
@@ -44,13 +45,16 @@ export type NestSlot = {
  * THE nested-range formula (the shader's `nestSlot` reproduces exactly this): the level this slot shows
  * at its own pixel (x, y) and its weight. The weight is the smallest edge weight over the point and the
  * source point(s) it reads, so a range that would read from outside its frame gives way to a coarser one.
+ * A nowcast slot maps (x, y) to motion px, walks back through the motion with `advectBack` (step by step,
+ * easing to the large-scale motion), and maps the result back to slot px.
  */
 export function nestSlotSample(s: NestSlot, x: number, y: number): { level: number; weight: number } {
   let w = edgeWeight(edgeDist(x, y), s.band);
   if (w <= 0) return { level: 0, weight: 0 };
   if (s.leadMs > 0) {
-    const [vx, vy] = flowAt(s.flow, s.motion.sx * x + s.motion.ox, s.motion.sy * y + s.motion.oy);
-    const sx = x - (s.leadMs * vx) / s.motion.sx, sy = y - (s.leadMs * vy) / s.motion.sy;
+    const m = s.motion;
+    const [qx, qy] = advectBack(s.flow, m.sx * x + m.ox, m.sy * y + m.oy, s.leadMs);
+    const sx = (qx - m.ox) / m.sx, sy = (qy - m.oy) / m.sy;
     w = Math.min(w, edgeWeight(edgeDist(sx, sy), s.band));
     return { level: bilinear(s.a, sx, sy, s.cell), weight: w };
   }
