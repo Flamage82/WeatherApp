@@ -1,8 +1,10 @@
 /**
  * Dev-only GPU/CPU parity check for the shader's nested-range sampler (INTERP_GLSL `nestSlot`,
  * with u_smooth = 0) against `nestSlotSample` in `src/motion/nest.ts`: the interpolation at each of
- * `alphas`, and the nowcast at each of `leads` (with `flow` as the motion field in px/ms), all with
- * edge band `band` and the identity motion mapping; plus one nowcast case through a 2x motion grid
+ * `alphas`, and the nowcast at each of `leads` (with `flow` as the motion field in px/ms; the default
+ * leads run from one step to NOWCAST_MAX_MS, so the multi-step path and its drift are covered, and `flow`
+ * should carry a `large` field so the easing is too), all with edge band `band` and the identity motion
+ * mapping; plus one nowcast case through a 2x motion grid
  * (`motion = { sx: 0.5, ox: 128, sy: 0.5, oy: 128 }`) with band 20. Renders (level, weight) for a grid
  * of pixel positions (fractional, and running past every edge of the frame) into an RGBA32F target
  * on an offscreen WebGL2 canvas, reads it back and compares both with the CPU. Needs
@@ -56,7 +58,7 @@ const HALF_MOTION: PixelAffine = { sx: 0.5, ox: 128, sy: 0.5, oy: 128 };
 
 export function runParity(
   a: LevelField, b: LevelField, flow: FlowField, cell: CellSize, alphas = [0, 0.25, 0.5, 0.75, 1], N = 256,
-  leads: number[] = [], band = 0,
+  leads: number[] = [300_000, 1_800_000, 3_600_000, 10_800_000], band = 0,
 ): ParityResult[] {
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = N;

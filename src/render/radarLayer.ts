@@ -103,11 +103,27 @@ export function uploadLevels(gl: WebGL2RenderingContext, t: WebGLTexture, f: Lev
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, f.width, f.height, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, f.data);
 }
 
-/** Flow as RG32F, gw x gh, cell (i, j) at texel (i, j). */
+/**
+ * A flow as RGBA floats per cell: rg = the detailed field, ba = the large-scale one (the detailed one
+ * again if the flow has none, e.g. an A->B pair flow, whose slots read only rg).
+ */
+export function packFlow(f: FlowField): Float32Array {
+  const n = f.gw * f.gh, large = f.large ?? f.data;
+  const out = new Float32Array(n * 4);
+  for (let k = 0; k < n; k++) {
+    out[4 * k] = f.data[2 * k]!;
+    out[4 * k + 1] = f.data[2 * k + 1]!;
+    out[4 * k + 2] = large[2 * k]!;
+    out[4 * k + 3] = large[2 * k + 1]!;
+  }
+  return out;
+}
+
+/** Flow as RGBA32F (see `packFlow`), gw x gh, cell (i, j) at texel (i, j). */
 export function uploadFlow(gl: WebGL2RenderingContext, t: WebGLTexture, f: FlowField): void {
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG32F, f.gw, f.gh, 0, gl.RG, gl.FLOAT, f.data);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, f.gw, f.gh, 0, gl.RGBA, gl.FLOAT, packFlow(f));
 }
 
 function deleteTextures(t: FrameTextures): void {

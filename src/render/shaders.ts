@@ -1,4 +1,5 @@
 import { NOWCAST_MAX_MS } from "../../shared/config";
+import { MAX_NOWCAST_STEPS, NOWCAST_STEP_MS, RELAX_MS } from "../motion/advect";
 import { FORECAST_MIN_OPACITY } from "../motion/interpolate";
 import { DATA_MARGIN_PX } from "../motion/nest";
 
@@ -6,12 +7,12 @@ import { DATA_MARGIN_PX } from "../motion/nest";
  * GLSL ES 3.00 sources for the radar layer.
  *
  * INTERP_GLSL is a line-for-line port of `src/motion/nest.ts` `edgeDist`, `edgeWeight` and
- * `nestSlotSample` (as `nestSlot`), `src/motion/interpolate.ts` `bilinear` and `forecastOpacity`, and
- * `src/motion/flow.ts` `flowAt`. Both bilinear lookups are done by hand with `texelFetch`, not
- * hardware filtering:
+ * `nestSlotSample` (as `nestSlot`), `src/motion/advect.ts` `advectBack` and `nowcastVelocity`,
+ * `src/motion/interpolate.ts` `bilinear` and `forecastOpacity`, and `src/motion/flow.ts` `flowAt`.
+ * Both bilinear lookups are done by hand with `texelFetch`, not hardware filtering:
  *  - level textures (R8UI): out-of-bounds taps read 0 exactly, which WebGL2 can't express with
  *    wrap modes (no clamp-to-border), and the tap positions match the CPU (value at integer coords);
- *  - flow texture (RG32F): float textures aren't filterable without OES_texture_float_linear, and
+ *  - flow texture (RGBA32F, rg = detailed field, ba = large-scale field): float textures aren't filterable without OES_texture_float_linear, and
  *    the CPU's grid mapping (cell i centred at (i+1)*512/(gw+1), clamped to the edge cell) is not
  *    the texture-space mapping LINEAR filtering would use anyway.
  * So the GPU result equals the CPU result up to float32 rounding. The same chunk is used by the
@@ -88,18 +89,19 @@ float levelAt(highp usampler2D t, vec2 p, int k) {
   return bilinearLevel(t, p, k);
 }
 
-// flowAt: cell (i, j) centred at full-res ((i+1)*512/(gw+1), (j+1)*512/(gh+1)); clamped to edge.
-vec2 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
+// flow.ts flowAt, both fields at once: cell (i, j) centred at full-res ((i+1)*512/(gw+1), (j+1)*512/(gh+1));
+// clamped to edge. Returns (detailed.xy, large-scale.zw); an A->B pair flow's large-scale half is unused.
+vec4 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
   vec2 gs = vec2(size);
   vec2 g = clamp(p * (gs + 1.0) / 512.0 - 1.0, vec2(0.0), gs - 1.0);
   vec2 g0 = floor(g);
   vec2 f = g - g0;
   ivec2 i0 = ivec2(g0);
   ivec2 i1 = min(i0 + 1, size - 1);
-  vec2 v00 = texelFetch(t, i0, 0).rg;
-  vec2 v10 = texelFetch(t, ivec2(i1.x, i0.y), 0).rg;
-  vec2 v01 = texelFetch(t, ivec2(i0.x, i1.y), 0).rg;
-  vec2 v11 = texelFetch(t, i1, 0).rg;
+  vec4 v00 = texelFetch(t, i0, 0);
+  vec4 v10 = texelFetch(t, ivec2(i1.x, i0.y), 0);
+  vec4 v01 = texelFetch(t, ivec2(i0.x, i1.y), 0);
+  vec4 v11 = texelFetch(t, i1, 0);
   return (v00 * (1.0 - f.x) + v10 * f.x) * (1.0 - f.y) + (v01 * (1.0 - f.x) + v11 * f.x) * f.y;
 }
 
@@ -126,7 +128,9 @@ float edgeWeight(float d, float band) {
 
 // THE nested-range formula, nest.ts nestSlotSample: (level, weight) of one slot at its own pixel p.
 // lead > 0: nowcast; fl is the motion field in the motion grid's px/ms and maff = (sx, ox, sy, oy)
-// maps this slot's px to the motion grid's px. Else A/B interpolation by the A->B flow fl:
+// maps this slot's px to the motion grid's px. The loop is advect.ts advectBack (with nowcastVelocity):
+// step back through the motion in motion px, easing from the detailed field to the large-scale one.
+// Else A/B interpolation by the A->B flow fl:
 //   F = flowAt(p); wa = A(p - alpha*F); wb = B(p + (1-alpha)*F); min((1-alpha)*wa + alpha*wb, max(wa, wb)).
 // The weight is the smallest edge weight over p and the source point(s).
 vec2 nestSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize, float alpha, float lead,
@@ -134,12 +138,22 @@ vec2 nestSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 
   float w = edgeWeight(edgeDist(p), band);
   if (w <= 0.0) return vec2(0.0, 0.0);
   if (lead > 0.0) {
-    vec2 v = flowAt(fl, fsize, vec2(maff.x * p.x + maff.y, maff.z * p.y + maff.w));
-    vec2 s = vec2(p.x - (lead * v.x) / maff.x, p.y - (lead * v.y) / maff.z);
+    vec2 q = vec2(maff.x * p.x + maff.y, maff.z * p.y + maff.w);
+    float tau = lead;
+    for (int i = 0; i < ${MAX_NOWCAST_STEPS}; i++) {
+      if (tau <= 0.0) break;
+      float h = min(${NOWCAST_STEP_MS.toFixed(1)}, tau);
+      vec4 fv = flowAt(fl, fsize, q);
+      float r = clamp((tau - 0.5 * h) / ${RELAX_MS.toFixed(1)}, 0.0, 1.0);
+      vec2 v = fv.xy + (fv.zw - fv.xy) * r;
+      q -= h * v;
+      tau -= h;
+    }
+    vec2 s = vec2((q.x - maff.y) / maff.x, (q.y - maff.w) / maff.z);
     w = min(w, edgeWeight(edgeDist(s), band));
     return vec2(levelAt(a, s, k), w);
   }
-  vec2 f = flowAt(fl, fsize, p);
+  vec2 f = flowAt(fl, fsize, p).xy;
   vec2 pa = p - alpha * f, pb = p + (1.0 - alpha) * f;
   w = min(w, min(edgeWeight(edgeDist(pa), band), edgeWeight(edgeDist(pb), band)));
   float wa = levelAt(a, pa, k), wb = levelAt(b, pb, k);

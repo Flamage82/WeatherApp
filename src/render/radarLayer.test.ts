@@ -10,7 +10,7 @@ import m664 from "../../shared/__fixtures__/IDR664.map?raw";
 import type { LevelField } from "../../shared/decodeFrame";
 import { IDENTITY_AFFINE } from "../../shared/gnomonic";
 import { ZERO_FLOW } from "../motion/flow";
-import { MAX_SLOTS, RadarLayer, type LayerSlot } from "./radarLayer";
+import { MAX_SLOTS, packFlow, RadarLayer, type LayerSlot } from "./radarLayer";
 
 /**
  * Minimal WebGL2 stand-in: every method is a no-op returning a fresh object, except that textures
@@ -112,5 +112,13 @@ describe("RadarLayer slots", () => {
     const l = new RadarLayer();
     expect(MAX_SLOTS).toBe(4);
     expect(() => l.setSlots([m504, m503, m502, m501, m664].map((m) => slot(m)))).toThrow();
+  });
+});
+
+describe("packFlow", () => {
+  it("puts the detailed field in rg and the large-scale one in ba, defaulting to the detailed", () => {
+    const data = new Float32Array([1, 2, 3, 4]);
+    expect(Array.from(packFlow({ gw: 2, gh: 1, data }))).toEqual([1, 2, 1, 2, 3, 4, 3, 4]);
+    expect(Array.from(packFlow({ gw: 2, gh: 1, data, large: new Float32Array([5, 6, 7, 8]) }))).toEqual([1, 2, 5, 6, 3, 4, 7, 8]);
   });
 });
