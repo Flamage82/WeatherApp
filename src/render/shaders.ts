@@ -119,10 +119,18 @@ float edgeWeight(float d, float band) {
   return t * t * (3.0 - 2.0 * t);
 }
 
+// advect.ts nowcastVelocity: the motion at motion px q, tauMs past the newest frame, easing from the
+// detailed field to the large-scale one.
+vec2 nowcastVelocity(highp sampler2D fl, ivec2 fsize, vec2 q, float tauMs) {
+  vec4 fv = flowAt(fl, fsize, q);
+  float r = clamp(tauMs / ${RELAX_MS.toFixed(1)}, 0.0, 1.0);
+  return fv.xy + (fv.zw - fv.xy) * r;
+}
+
 // THE nested-range formula, nest.ts nestSlotSample: (level, weight) of one slot at its own pixel p.
 // lead > 0: nowcast; fl is the motion field in the motion grid's px/ms and maff = (sx, ox, sy, oy)
-// maps this slot's px to the motion grid's px. The loop is advect.ts advectBack (with nowcastVelocity):
-// step back through the motion in motion px, easing from the detailed field to the large-scale one.
+// maps this slot's px to the motion grid's px. The loop is advect.ts advectBack: midpoint steps back
+// through the motion, in motion px.
 // Else A/B interpolation by the A->B flow fl:
 //   F = flowAt(p); wa = A(p - alpha*F); wb = B(p + (1-alpha)*F); min((1-alpha)*wa + alpha*wb, max(wa, wb)).
 // The weight is the smallest edge weight over p and the source point(s).
@@ -135,10 +143,9 @@ vec2 nestSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 
     float tau = lead;
     for (int i = 0; i < ${MAX_NOWCAST_STEPS}; i++) {
       if (tau <= 0.0) break;
-      float h = min(${NOWCAST_STEP_MS.toFixed(1)}, tau);
-      vec4 fv = flowAt(fl, fsize, q);
-      float r = clamp((tau - 0.5 * h) / ${RELAX_MS.toFixed(1)}, 0.0, 1.0);
-      vec2 v = fv.xy + (fv.zw - fv.xy) * r;
+      float h = min(${NOWCAST_STEP_MS.toFixed(1)}, tau), tm = tau - 0.5 * h;
+      vec2 u = nowcastVelocity(fl, fsize, q, tm);
+      vec2 v = nowcastVelocity(fl, fsize, q - 0.5 * h * u, tm);
       q -= h * v;
       tau -= h;
     }

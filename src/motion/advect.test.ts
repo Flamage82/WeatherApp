@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { NOWCAST_MAX_MS } from "../../shared/config";
-import { advectBack, nowcastDeformation } from "./advect";
+import { advectBack, NOWCAST_STEP_MS, nowcastDeformation } from "./advect";
 import { flowAt, forecastFlow, type FlowField } from "./flow";
 
 /** A 31x31 field, every cell measured, with `fn(cx, cy)` at each cell centre (full-res px). */
@@ -35,15 +35,22 @@ describe("nowcast advection", () => {
     expect(ratio(noEase)).toBeGreaterThan(1.5);
   });
 
-  it("matches the old single jump at a lead within one step, with easing off", () => {
+  it("stays within a fraction of a pixel of the old single jump at a lead within one step, with easing off", () => {
     const v = forecastFlow([cellFlow((cx, cy) => [1e-5 * Math.sin(cx / 50), 1e-5 * Math.cos(cy / 70)])], [1]);
     const off = { ...v, large: v.data };
     for (const [x, y] of [[100.3, 200.7], [256, 256], [410.5, 90.25]] as const) {
       const [vx, vy] = flowAt(off, x, y);
       const [sx, sy] = advectBack(off, x, y, 240_000);
-      expect(sx).toBeCloseTo(x - 240_000 * vx, 9);
-      expect(sy).toBeCloseTo(y - 240_000 * vy, 9);
+      expect(Math.abs(sx - (x - 240_000 * vx))).toBeLessThan(0.25);
+      expect(Math.abs(sy - (y - 240_000 * vy))).toBeLessThan(0.25);
     }
+  });
+
+  it("doesn't fold where a 5-minute Euler step would flip the mapping (step x gradient > 1)", () => {
+    const c = 1.2 / NOWCAST_STEP_MS; // gradient: one Euler step multiplies the spacing by 1 - 1.2 = -0.2
+    const v = forecastFlow([cellFlow((cx) => [c * (cx - 256), 0])], [1]);
+    const off = { ...v, large: v.data };
+    expect(nowcastDeformation(off, 3 * NOWCAST_STEP_MS, mid).minDet).toBeGreaterThan(0);
   });
 
   it("caps at MAX_NOWCAST_STEPS: a lead past NOWCAST_MAX_MS goes no further", () => {

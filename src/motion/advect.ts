@@ -23,15 +23,18 @@ export function nowcastVelocity(v: FlowField, x: number, y: number, tauMs: numbe
 /**
  * THE nowcast formula (the shader's `nestSlot` reproduces exactly this, step for step): the source point,
  * in motion px, of the rain that is at motion px (qx, qy) `leadMs` after the newest frame. It walks back
- * in NOWCAST_STEP_MS steps, reading the motion at the current point and the step's mid-time. Paths that
- * follow a smooth field can't cross, so the mapping doesn't fold; and the image is read once, at the end,
- * so the forecast is as sharp as a real frame. At lead <= one step this is a single straight jump.
+ * in NOWCAST_STEP_MS midpoint (RK2) steps: the motion at the step's mid-time, read at the point a half
+ * step along the motion at the current point. Paths that follow a smooth field can't cross, so the
+ * mapping doesn't fold; and the image is read once, at the end, so the forecast is as sharp as a real
+ * frame. The midpoint step, not a plain Euler one, because real flow fields change by up to a step's
+ * length between neighbouring cells, and an Euler step then folds the mapping.
  */
 export function advectBack(v: FlowField, qx: number, qy: number, leadMs: number): [number, number] {
   let tau = leadMs;
   for (let k = 0; k < MAX_NOWCAST_STEPS && tau > 0; k++) {
-    const h = Math.min(NOWCAST_STEP_MS, tau);
-    const [vx, vy] = nowcastVelocity(v, qx, qy, tau - h / 2);
+    const h = Math.min(NOWCAST_STEP_MS, tau), tm = tau - h / 2;
+    const [ux, uy] = nowcastVelocity(v, qx, qy, tm);
+    const [vx, vy] = nowcastVelocity(v, qx - 0.5 * h * ux, qy - 0.5 * h * uy, tm);
     qx -= h * vx; qy -= h * vy; tau -= h;
   }
   return [qx, qy];
