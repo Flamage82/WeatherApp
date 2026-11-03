@@ -1,11 +1,14 @@
 import { NOWCAST_MAX_MS } from "../../shared/config";
-import { flowAt, type FlowField } from "./flow";
+import { flowAt, flowAtBoth, type FlowField } from "./flow";
 
 /** Backward-advection step, about one frame gap. */
 export const NOWCAST_STEP_MS = 300_000;
 /** Forecast time over which the motion eases from the detailed field to the large-scale one. */
 export const RELAX_MS = 3_600_000;
-/** Steps in the longest nowcast. Both copies stop here, so a lead past NOWCAST_MAX_MS goes no further. */
+/**
+ * Steps in the longest nowcast. Both copies stop here, so the loop is bounded. A lead past NOWCAST_MAX_MS
+ * drops the near-"now" end of the path instead of going further (the app never asks: the lead is clamped).
+ */
 export const MAX_NOWCAST_STEPS = Math.ceil(NOWCAST_MAX_MS / NOWCAST_STEP_MS);
 
 /**
@@ -14,8 +17,7 @@ export const MAX_NOWCAST_STEPS = Math.ceil(NOWCAST_MAX_MS / NOWCAST_STEP_MS);
  * outlast the first hour but the steering flow does. Without `large` the two are the same.
  */
 export function nowcastVelocity(v: FlowField, x: number, y: number, tauMs: number): [number, number] {
-  const [lx, ly] = flowAt(v, x, y);
-  const [gx, gy] = flowAt(v, x, y, v.large ?? v.data);
+  const [lx, ly, gx, gy] = flowAtBoth(v, x, y);
   const r = Math.min(1, Math.max(0, tauMs / RELAX_MS));
   return [lx + (gx - lx) * r, ly + (gy - ly) * r];
 }

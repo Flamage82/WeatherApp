@@ -225,15 +225,33 @@ export function forecastFlow(flows: FlowField[], gapsMs: number[]): FlowField {
  * Grid coords gx = x * (gw + 1) / 512 - 1 are clamped to [0, gw-1] (nearest edge value outside).
  */
 export function flowAt(f: FlowField, x: number, y: number, field: Float32Array = f.data): [number, number] {
+  const [i00, i10, i01, i11, tx, ty] = flowCell(f, x, y);
+  return [bilerp(field, i00, i10, i01, i11, tx, ty, 0), bilerp(field, i00, i10, i01, i11, tx, ty, 1)];
+}
+
+/**
+ * `flowAt` of both `f.data` and `f.large ?? f.data` with one cell lookup: (detailed x, y, large-scale x, y),
+ * each exactly what `flowAt` gives. The shader's `flowAt` returns the same four numbers.
+ */
+export function flowAtBoth(f: FlowField, x: number, y: number): [number, number, number, number] {
+  const [i00, i10, i01, i11, tx, ty] = flowCell(f, x, y), g = f.large ?? f.data;
+  return [
+    bilerp(f.data, i00, i10, i01, i11, tx, ty, 0), bilerp(f.data, i00, i10, i01, i11, tx, ty, 1),
+    bilerp(g, i00, i10, i01, i11, tx, ty, 0), bilerp(g, i00, i10, i01, i11, tx, ty, 1),
+  ];
+}
+
+/** The four surrounding cells' array offsets (00, 10, 01, 11) and the bilinear weights (tx, ty) at (x, y). */
+function flowCell(f: FlowField, x: number, y: number): [number, number, number, number, number, number] {
   const gxr = Math.min(f.gw - 1, Math.max(0, (x * (f.gw + 1)) / FULL - 1));
   const gyr = Math.min(f.gh - 1, Math.max(0, (y * (f.gh + 1)) / FULL - 1));
   const x0 = Math.floor(gxr), y0 = Math.floor(gyr);
   const x1 = Math.min(f.gw - 1, x0 + 1), y1 = Math.min(f.gh - 1, y0 + 1);
-  const tx = gxr - x0, ty = gyr - y0;
-  const d = field;
-  const at = (xx: number, yy: number, c: number) => d[(yy * f.gw + xx) * 2 + c]!;
-  const lerp = (c: number) =>
-    (at(x0, y0, c) * (1 - tx) + at(x1, y0, c) * tx) * (1 - ty) +
-    (at(x0, y1, c) * (1 - tx) + at(x1, y1, c) * tx) * ty;
-  return [lerp(0), lerp(1)];
+  return [
+    (y0 * f.gw + x0) * 2, (y0 * f.gw + x1) * 2, (y1 * f.gw + x0) * 2, (y1 * f.gw + x1) * 2, gxr - x0, gyr - y0,
+  ];
+}
+
+function bilerp(d: Float32Array, i00: number, i10: number, i01: number, i11: number, tx: number, ty: number, c: number): number {
+  return (d[i00 + c]! * (1 - tx) + d[i10 + c]! * tx) * (1 - ty) + (d[i01 + c]! * (1 - tx) + d[i11 + c]! * tx) * ty;
 }

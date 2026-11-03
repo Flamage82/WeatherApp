@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { LevelField } from "../../shared/decodeFrame";
-import { computeFlow, flowAt, forecastFlow, ZERO_FLOW, type FlowField } from "./flow";
+import { computeFlow, flowAt, flowAtBoth, forecastFlow, ZERO_FLOW, type FlowField } from "./flow";
 
 export function makeDisc(cx: number, cy: number, r: number, level: number, into?: LevelField): LevelField {
   const f: LevelField = into ?? { width: 512, height: 512, data: new Uint8Array(512 * 512) };
@@ -34,6 +34,11 @@ describe("computeFlow", () => {
     const f = computeFlow(empty(), empty());
     expect(f.gw).toBe(31);
     expect(f.data.every((v) => v === 0)).toBe(true);
+  });
+  it("flowAtBoth gives exactly flowAt of the detailed and of the large-scale field", () => {
+    const v = forecastFlow([cellFlow((cx, cy) => [1e-5 * Math.sin(cx / 50), 1e-5 * Math.cos(cy / 70)])], [1]);
+    for (const [x, y] of [[100.3, 200.7], [256, 256], [-20, 600], [511.9, 3.1]] as const)
+      expect(flowAtBoth(v, x, y)).toEqual([...flowAt(v, x, y), ...flowAt(v, x, y, v.large)]);
   });
   it("flowAt clamps and ZERO_FLOW is zero", () => {
     expect(flowAt(ZERO_FLOW, 100, 100)).toEqual([0, 0]);

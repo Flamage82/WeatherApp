@@ -80,7 +80,7 @@ level = A(s);  weight = min(edge weight at p, edge weight at s)
 - Plain Euler steps, with velocity read at the current point and at the step's mid-time **(call)**. The builder may use a midpoint (RK2) step instead if it measurably helps, in both CPU and shader. **Built as midpoint (RK2), 2026-11-04:** on the 3 Nov 2026 Brisbane storm, neighbouring flow cells differ by up to 14 px per 5 min across 16 px, so step × gradient reaches ~0.9 and Euler still folded at +1 h and +2 h (minDet −0.025, −0.001; maxStretch up to 21 000). Midpoint at the same 5-minute step gave minDet > 0 and maxStretch ≤ 72 at +30 min to +3 h. The cost is two flow reads per step. With easing off, a lead within one step is therefore within a fraction of a pixel of the old single jump, not identical.
 - Points outside the motion grid keep today's behaviour: `flowAt` clamps them to the edge cell.
 - The edge weight is checked at `p` and at the final `s` only, as today.
-- At lead 0 the path is empty and `s = p`, and with easing off (§4.2) a lead ≤ `STEP_MS` is exactly today's single jump. So nothing jumps at "now", and the first few minutes past it look as they do today.
+- At lead 0 the path is empty and `s = p`, and with easing off (§4.2) a lead ≤ `STEP_MS` is within a fraction of a pixel of today's single jump (exactly so with Euler steps; the midpoint step in §4.1 differs by a second-order term). So nothing jumps at "now", and the first few minutes past it look as they do today.
 
 ### 4.2 Easing toward the large-scale motion (fixes squeezing) **(user: option 2)**
 
