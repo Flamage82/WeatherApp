@@ -38,6 +38,30 @@ function median9(v: number[]): number {
   return v[4]!;
 }
 
+/**
+ * Sum of absolute differences between the BLOCK x BLOCK block of A at (ox, oy) and B shifted by (u, v);
+ * B reads 0 outside the image. Starts from `init` and stops early once the sum reaches `limit`.
+ */
+function blockSad(A: Float32Array, B: Float32Array, ox: number, oy: number, u: number, v: number, init = 0, limit = Infinity): number {
+  let sad = init;
+  for (let y = 0; y < BLOCK && sad < limit; y++) {
+    const by = oy + y + v;
+    for (let x = 0; x < BLOCK; x++) {
+      const bx = ox + x + u;
+      const bval = bx < 0 || by < 0 || bx >= SMALL || by >= SMALL ? 0 : B[by * SMALL + bx]!;
+      sad += Math.abs(A[(oy + y) * SMALL + ox + x]! - bval);
+    }
+  }
+  return sad;
+}
+
+/** Offset of the minimum of a parabola through the SADs at b-1, b, b+1, clamped to +-0.5; 0 if b is at the search edge or isn't a clean minimum. */
+function subPixel(sMinus: number, s0: number, sPlus: number, b: number): number {
+  const denom = sMinus - 2 * s0 + sPlus;
+  if (Math.abs(b) === SEARCH || !(denom > 0)) return 0;
+  return Math.min(0.5, Math.max(-0.5, (sMinus - sPlus) / (2 * denom)));
+}
+
 /** Coarse block-matching flow between two frames. Result vectors are full-res px, A -> B. */
 export function computeFlow(a: LevelField, b: LevelField): FlowField {
   const A = downsample(a);
@@ -60,19 +84,15 @@ export function computeFlow(a: LevelField, b: LevelField): FlowField {
       for (let v = -SEARCH; v <= SEARCH; v++)
         for (let u = -SEARCH; u <= SEARCH; u++) {
           // Tiny bias toward small motion breaks ties (e.g. uniform interiors).
-          let sad = 1e-4 * (u * u + v * v);
-          for (let y = 0; y < BLOCK && sad < best; y++) {
-            const by = oy + y + v;
-            for (let x = 0; x < BLOCK; x++) {
-              const bx = ox + x + u;
-              const bval = bx < 0 || by < 0 || bx >= SMALL || by >= SMALL ? 0 : B[by * SMALL + bx]!;
-              sad += Math.abs(A[(oy + y) * SMALL + ox + x]! - bval);
-            }
-          }
+          const sad = blockSad(A, B, ox, oy, u, v, 1e-4 * (u * u + v * v), best);
           if (sad < best) { best = sad; bu = u; bv = v; }
         }
+      // The search exits early, so the neighbours' scores are measured again in full for the parabola fit.
+      const s0 = blockSad(A, B, ox, oy, bu, bv);
       const k = j * GRID + i;
-      vx[k] = bu; vy[k] = bv; valid[k] = 1; anyValid = true;
+      vx[k] = bu + subPixel(blockSad(A, B, ox, oy, bu - 1, bv), s0, blockSad(A, B, ox, oy, bu + 1, bv), bu);
+      vy[k] = bv + subPixel(blockSad(A, B, ox, oy, bu, bv - 1), s0, blockSad(A, B, ox, oy, bu, bv + 1), bv);
+      valid[k] = 1; anyValid = true;
     }
 
   const out = new Float32Array(n * 2);

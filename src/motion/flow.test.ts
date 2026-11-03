@@ -19,6 +19,13 @@ describe("computeFlow", () => {
     expect(Math.abs(dx - 16)).toBeLessThan(1.5);
     expect(Math.abs(dy - 8)).toBeLessThan(1.5);
   });
+  it("recovers a shift that isn't a multiple of 4 px to within 1 px (sub-pixel)", () => {
+    for (const [dx, dy] of [[18, 6], [6, 18]] as const) {
+      const [vx, vy] = flowAt(computeFlow(patch(0, 0), patch(dx, dy)), 225, 225);
+      expect(Math.abs(vx - dx)).toBeLessThan(1);
+      expect(Math.abs(vy - dy)).toBeLessThan(1);
+    }
+  });
   it("identical frames give ~zero flow", () => {
     const f = computeFlow(makeDisc(200, 200, 20, 10), makeDisc(200, 200, 20, 10));
     for (let i = 0; i < f.data.length; i += 2) expect(Math.hypot(f.data[i]!, f.data[i + 1]!)).toBeLessThan(0.5);
@@ -45,18 +52,18 @@ describe("computeFlow", () => {
   });
 });
 
-describe("forecastFlow", () => {
-  /** A textured square of rain (pseudo-random 8 px tiles), shifted by (dx, dy). */
-  const patch = (dx: number, dy: number): LevelField => {
-    const f = empty();
-    for (let y = 150; y < 300; y++)
-      for (let x = 150; x < 300; x++) {
-        const tx = (x - 150) >> 3, ty = (y - 150) >> 3;
-        f.data[(y + dy) * 512 + x + dx] = 1 + (((tx * 73856093) ^ (ty * 19349663)) >>> 0) % 15;
-      }
-    return f;
-  };
+/** A textured square of rain (pseudo-random 8 px tiles), shifted by (dx, dy). */
+const patch = (dx: number, dy: number): LevelField => {
+  const f = empty();
+  for (let y = 150; y < 300; y++)
+    for (let x = 150; x < 300; x++) {
+      const tx = (x - 150) >> 3, ty = (y - 150) >> 3;
+      f.data[(y + dy) * 512 + x + dx] = 1 + (((tx * 73856093) ^ (ty * 19349663)) >>> 0) % 15;
+    }
+  return f;
+};
 
+describe("forecastFlow", () => {
   it("fills a far empty corner with the patch's motion, in px/ms", () => {
     const v = forecastFlow([computeFlow(patch(0, 0), patch(16, 8))], [300_000]);
     for (const [x, y] of [[500, 500], [10, 500], [500, 10]] as const) {
