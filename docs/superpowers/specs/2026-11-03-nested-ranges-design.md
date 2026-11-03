@@ -60,7 +60,7 @@ The map now shows **one** range of the active radar at a time: the sharpest rang
 ### 4.2 Blend at the edges **(user: narrow blend)**
 - At each finer range's frame edge, its weight fades from 1 to 0 over a band **inside** its frame: about **5 km** at the 64 km → 128 km edge.
 - **(call)** The wider edges (128 → 256, 256 → 512) use a band scaled to the coarser side's cell size, about 3 of its cells (~6 km and ~12 km), so the blend isn't narrower than one coarse cell. The builder tunes the exact widths by eye.
-- **(call)** Blend **levels**, then colour, as the mockup did: `level = w·fine + (1 − w)·coarse`. Not premultiplied colours, which would mix hues. The nowcast opacity (`forecastOpacity`) is applied per range and blended with the same weights, since the ranges' leads differ by a few minutes.
+- **(call)** Blend **levels**, then colour, as the mockup did: `level = w·fine + (1 − w)·coarse`. Not premultiplied colours, which would mix hues. (The nowcast used to fade with lead, blended per range with the same weights; that fade is gone, `2026-11-04-nowcast-distortion-design.md` §4.4.)
 - **(call)** The weight curve is a smoothstep across the band.
 
 ### 4.3 Where a range has no data **(call; important)**
@@ -72,11 +72,11 @@ The map now shows **one** range of the active radar at a time: the sharpest rang
 
 ### 4.4 The nowcast **(user, after §9)**
 - **One motion field per region.** Inside the 128 km frame, the nowcast motion `V` is the **128 km range's** forecast flow (`forecastFlow` over its last ≤ 3 pairs, as now), for **every** range drawn there, including the 64 km range. Outside the 128 km frame, the 256 km and 512 km ranges each use their own forecast flow **(call)**.
-- **Each range moves its own newest image.** At pixel `p` and time `t`, a range whose newest frame is at `t_r` reads its newest image at `p − (t − t_r)·V(p)`, with `V` looked up once at `p` and converted between pixel grids with the affine mapping (§3). The lead differs per range by its newest frame's age; the motion doesn't.
+- **Each range moves its own newest image.** At pixel `p` and time `t`, a range whose newest frame is at `t_r` reads its newest image at the source point found by walking back from `p` through the motion field for `t − t_r`, in 5-minute steps, converting between pixel grids with the affine mapping (§3); see `2026-11-04-nowcast-distortion-design.md` §4.1–4.2 (this replaces the single jump `p − (t − t_r)·V(p)`). The lead differs per range by its newest frame's age; the motion doesn't.
 - The 64 km image therefore keeps its detail in the prediction, so nothing visibly changes at "now" (anti-goal 5). §9 found the 128 km range's own prediction scores the same as this, but would blur at "now".
 - Where the source point lies outside a finer range's frame, the coarser range's image fills in (§4.3).
 - **Until the 128 km range's forecast flow is ready** (start-up, or right after a radar switch), the 64 km range uses its own forecast flow, which is today's behaviour **(call)**. The swap happens when the 128 km flow arrives. A small jump in the prediction at that moment is acceptable.
-- Opacity fading with lead (`forecastOpacity`), the 60 min limit and the clock's "+N min forecast" are unchanged.
+- The 60 min limit (now 3 h) and the clock's "+N min forecast" are unchanged. The fade with lead (`forecastOpacity`) is gone (`2026-11-04-nowcast-distortion-design.md` §4.4).
 
 ## 5. Loading and priority **(user agreed to the playback; details are calls)**
 

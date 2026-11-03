@@ -26,11 +26,14 @@ import { FrameStore } from "../data/frameStore";
 import type { Place } from "../location/geocode";
 import { locateOnce } from "../location/locate";
 import { BRISBANE, inCoverage, loadLocation, rememberDefault, saveLocation, type SavedLocation } from "../location/location";
+import { nowcastDeformation } from "../motion/advect";
+import { runParity } from "../render/parity";
 import type { RadarLayer } from "../render/radarLayer";
 import { Tape } from "../tape/Tape";
 import { buildHomeForecast } from "../tape/homeSeries";
 import { DEFAULT_SPAN_MS, SERIES_STEP_MS } from "../tape/tapeMath";
 import { stepPlayback, type PlayState } from "../time/timeline";
+import { pinApiTo, pinnedNowFromSearch } from "./pinnedNow";
 import { RadarView } from "./radarView";
 
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
@@ -39,6 +42,10 @@ const STYLE_LIGHT = "https://tiles.openfreemap.org/styles/positron";
 const STYLE_DARK = "https://tiles.openfreemap.org/styles/dark";
 /** The clock's "−N min" and the status bar's "updated N min ago" are refreshed this often. */
 const NOW_TICK_MS = 10_000;
+// Dev only: `?now=YYYYMMDDHHMM` (UTC) replays a past storm with the clock pinned to that instant.
+const PINNED_NOW = import.meta.env.DEV ? pinnedNowFromSearch(location.search) : null;
+const clockNow = PINNED_NOW === null ? Date.now : () => PINNED_NOW;
+const liveApi = { fetchManifest, fetchFrame, fetchMeta, fetchDay, fetchEarliest };
 /** How long a message from the location controls stays up. */
 const TOAST_MS = 3_000;
 /** How often the on-device frame cache drops its expired entries while the page is open. */
@@ -129,10 +136,10 @@ export function RadarScreen() {
   const play = useRef<PlayState>({ t: 0, speed: 0, lastSpeed: 1 });
   const manual = useRef({ tape: false, lever: false });
   const [speed, setSpeedUi] = useState(0);
-  const [now, setNow] = useState(Date.now);
+  const [now, setNow] = useState(clockNow);
 
   useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), NOW_TICK_MS);
+    const id = setInterval(() => setNow(clockNow()), NOW_TICK_MS);
     return () => clearInterval(id);
   }, []);
 
@@ -155,10 +162,10 @@ export function RadarScreen() {
 
     const flow = createFlowClient();
     const store = new FrameStore({
-      api: { fetchManifest, fetchFrame, fetchMeta, fetchDay, fetchEarliest },
+      api: PINNED_NOW === null ? liveApi : pinApiTo(liveApi, PINNED_NOW),
       decode: decodeFrame,
       flow: flow.compute,
-      now: Date.now,
+      now: clockNow,
       location: { point: initial.location, override: initial.location.radarOverride },
     });
     const view = new RadarView(map, store, (l) => addRadarLayer(map, l));
@@ -215,8 +222,8 @@ export function RadarScreen() {
     void sweepFrameCache(Date.now());
     const sweepId = setInterval(() => void sweepFrameCache(Date.now()), SWEEP_MS);
 
-    // DEV-only handle for Playwright checks.
-    if (import.meta.env.DEV) Object.assign(window, { __radar: { map, store, view } });
+    // DEV-only handle for Playwright checks and the console (nowcast distortion before/after, GPU/CPU parity).
+    if (import.meta.env.DEV) Object.assign(window, { __radar: { map, store, view, nowcastDeformation, runParity } });
 
     return () => {
       clearInterval(sweepId);
