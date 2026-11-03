@@ -7,7 +7,7 @@ import { radarGlob, shouldRefreshMeta } from "./index";
 const NOW = Date.UTC(2026, 9, 27, 3, 0); // 2026-10-27 03:00 UTC
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
 
-function fakeBucket(keys: string[], pageSize = 1000, homes: Record<string, string> = {}) {
+function fakeBucket(keys: string[], pageSize = 1000) {
   const store = new Map<string, Uint8Array | string>([
     ["meta/IDR503.json", JSON.stringify({ fetchedAt: "x" })],
     ["frames/IDR503/202610270200.png", PNG],
@@ -28,7 +28,7 @@ function fakeBucket(keys: string[], pageSize = 1000, homes: Record<string, strin
     const slice = all.slice(start, start + size);
     const truncated = start + size < all.length;
     return {
-      objects: slice.map((key) => ({ key, ...(key in homes ? { customMetadata: { home: homes[key]! } } : {}) })),
+      objects: slice.map((key) => ({ key })),
       truncated,
       ...(truncated ? { cursor: String(start + size) } : {}),
     };
@@ -165,41 +165,12 @@ describe("handleApi", () => {
     expect(list.mock.calls.length).toBeGreaterThan(1);
   });
 
-  describe("series", () => {
-    const keys = ["202610262350", "202610260000", "202610260010"].map((s) => `frames/IDR504/${s}.png`);
-    const homes = { [keys[0]!]: "3", [keys[1]!]: "0" }; // the 0010 frame has no home metadata
-    const get = (path: string, now = NOW) => {
-      const b = fakeBucket(keys, 1, homes);
-      return handleApi(req(path), b.bucket, now).then((res) => ({ res, ...b }));
-    };
-
-    it("lists ascending points across pages, skipping frames without home, immutable for a past day", async () => {
-      const { res, list } = await get("/api/series/IDR504/20261026");
-      expect(await res.json()).toEqual({
-        product: "IDR504",
-        day: "20261026",
-        points: [
-          ["202610260000", 0],
-          ["202610262350", 3],
-        ],
-      });
-      expect(res.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
-      expect(list.mock.calls.length).toBeGreaterThan(1);
-      expect(list.mock.calls[0]![0]).toMatchObject({ include: ["customMetadata"] });
-    });
-
-    it("uses max-age=60 for today and an empty list for a day with no frames", async () => {
-      const { res } = await get("/api/series/IDR504/20261027");
-      expect(res.headers.get("cache-control")).toBe("public, max-age=60");
-      expect(((await res.json()) as { points: unknown[] }).points).toEqual([]);
-    });
-
-    it.each(["20261028", "2026102", "20261340"])("404s on %s without touching the bucket", async (day) => {
-      const { res, get: bget, list } = await get(`/api/series/IDR504/${day}`);
-      expect(res.status).toBe(404);
-      expect(bget).not.toHaveBeenCalled();
-      expect(list).not.toHaveBeenCalled();
-    });
+  it("has no series route any more", async () => {
+    const { bucket, get, list } = fakeBucket([]);
+    const res = await handleApi(req("/api/series/IDR504/20261026"), bucket, NOW);
+    expect(res.status).toBe(404);
+    expect(get).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
   });
 
   it("earliest: the first frame key of the product, from one list call with limit 1", async () => {

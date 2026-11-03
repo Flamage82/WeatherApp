@@ -1,7 +1,5 @@
-import { encode } from "fast-png";
 import { describe, expect, it, vi } from "vitest";
 import type { ProductId } from "../shared/config";
-import { homePixel } from "../shared/homeSample";
 import m504 from "../shared/__fixtures__/IDR504.map?raw";
 import { parseMapFile } from "./mapFile";
 import type { FtpSource } from "./ftpProtocol";
@@ -276,68 +274,16 @@ describe("runIngest", () => {
     expect((await count(undefined, false)).n).toBe(0);
   });
 
-  describe("home level on the tape product", () => {
-      const homePng = () => {
-      const { x, y } = homePixel(g504);
-      const data = new Uint8Array(512 * 512);
-      for (let py = 0; py < 512; py++) {
-        for (let px = 0; px < 512; px++) if ((px - x) ** 2 + (py - y) ** 2 < 25) data[py * 512 + px] = 1;
-      }
-      return encode({ width: 512, height: 512, data, depth: 8, channels: 1, palette: [[0, 0, 0, 0], [0xff, 0x96, 0, 255]] });
-    };
-    const setup = (product: ProductId, bytes: Uint8Array) => {
-      const b = fakeBucket();
-      seedState(b, { newest: allNewest(S1) });
-      b.store.set("meta/IDR504.json", JSON.stringify({ ...g504, fetchedAt: freshMeta() }));
-      const f = fakeFtp({ [product]: [S1, S2] });
-      f.retrieve.mockImplementation(async () => bytes as Uint8Array<ArrayBuffer>);
-      return { b, f };
-    };
-    const frameOpts = (b: B, product: string) => b.put.mock.calls.find((c) => c[0] === `frames/${product}/${S2}.png`)![2];
-
-    it("IDR504 frame carries the level at the home pixel", async () => {
-      const { b, f } = setup("IDR504", homePng());
-      await run(b, f);
-      expect(frameOpts(b, "IDR504")).toEqual({ httpMetadata: { contentType: "image/png" }, customMetadata: { home: "10" } });
+  it("an ingested frame is put without customMetadata, even with no geometry stored", async () => {
+    const b = fakeBucket();
+    seedState(b, { newest: allNewest(S1) });
+    const f = fakeFtp({ IDR504: [S1, S2] });
+    const r = await run(b, f);
+    expect(b.put.mock.calls.find((c) => c[0] === `frames/IDR504/${S2}.png`)![2]).toEqual({
+      httpMetadata: { contentType: "image/png" },
     });
-
-    it("other products get no home metadata", async () => {
-      const { b, f } = setup("IDR503", homePng());
-      await run(b, f);
-      expect(frameOpts(b, "IDR503")).toEqual({ httpMetadata: { contentType: "image/png" } });
-    });
-
-    it("an undecodable PNG still stores the frame and advances state, with one error", async () => {
-      const { b, f } = setup("IDR504", enc.encode("garbage"));
-      const r = await run(b, f);
-      expect(frameOpts(b, "IDR504")).toEqual({ httpMetadata: { contentType: "image/png" } });
-      expect(state(b).newest.IDR504).toBe(S2);
-      expect(r.errors).toHaveLength(1);
-    });
-
-    it("no geometry at all: tape frames are not put and newest does not advance, so the next run retries", async () => {
-      const b = fakeBucket();
-      seedState(b, { newest: allNewest(S1) });
-      for (const p of MARBURG.filter((p) => p !== "IDR504")) seedMeta(b, p);
-      const f = fakeFtp({ IDR504: [S1, S2] }, { failRetrieve: (p) => p.endsWith(".map") });
-      const r = await run(b, f, { refreshMeta: true });
-      expect(b.store.has(`frames/IDR504/${S2}.png`)).toBe(false);
-      expect(state(b).newest.IDR504).toBe(S1);
-      expect(state(b).lastError.IDR504).toBe("no geometry");
-      expect(r.errors).toHaveLength(2); // the failed map and the refused frames
-    });
-
-    it("a failed map refetch falls back to the stale stored geometry, so frames still get their level", async () => {
-      const { b, f } = setup("IDR504", homePng());
-      seedGeo(b, new Date(NOW - 8 * 24 * HOUR).toISOString());
-      f.retrieve.mockImplementation(async (p: string) => {
-        if (p.endsWith(".map")) throw new Error("map down");
-        return homePng() as Uint8Array<ArrayBuffer>;
-      });
-      const r = await run(b, f, { refreshMeta: true });
-      expect(frameOpts(b, "IDR504")).toEqual({ httpMetadata: { contentType: "image/png" }, customMetadata: { home: "10" } });
-      expect(r.errors).toContain("IDR504: meta: map down");
-    });
+    expect(r.errors).toEqual([]);
+    expect(state(b).newest.IDR504).toBe(S2);
   });
 
   it("a stamp that appears late (older than newest) is still fetched", async () => {

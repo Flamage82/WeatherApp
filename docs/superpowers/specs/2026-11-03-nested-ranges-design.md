@@ -145,6 +145,8 @@ Limits: 8 days of archive, one flow algorithm, Marburg only.
 
 ## 10. Later: a movable home **(user, 2026-11-03; not part of this work)**
 
+> **Handled by `2026-11-03-movable-location-design.md`.** The tape product is now computed at run time, the radar is chosen by distance, and sampling at the location moved to the phone, so the "known later problems" below no longer apply.
+
 The user plans to replace the hard-coded `HOME` with the device's location or a typed address. This work shouldn't build that, but it shouldn't make it harder either:
 - **Nesting, blending and the shared nowcast motion (§4) don't depend on home.** They depend only on the radar's geography.
 - **Don't hard-code "home is in the 64 km square".** Write the always-loaded set (§5), "now" (§5.1) and the tape's nowcast (§6) in terms of **the tape product**: the finest range covering home, which today is `RADARS[radar].tapeProduct`. A home in the 128 km ring would then make 128 km the tape product, with the 256 km range's newest frames supplying the outside rain. The tape's nowcast sampler takes home's pixel as an input, as `homePixel(geom)` does now.

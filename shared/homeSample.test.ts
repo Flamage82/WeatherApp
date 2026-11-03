@@ -3,11 +3,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { parseMapFile } from "../worker/mapFile";
-import { HOME } from "./config";
 import { decodeFrame, type LevelField } from "./decodeFrame";
-import { homePixel, maxLevelInDisc, sampleHomeFromPng } from "./homeSample";
+import { maxLevelInDisc, pointPixel, samplePointFromPng } from "./homeSample";
 import m504 from "./__fixtures__/IDR504.map?raw";
 import type { RadarGeometry } from "./types";
+
+const CALVERT = { lat: -27.67217111736596, lon: 152.49661614726207 };
 
 const g504 = parseMapFile(m504);
 
@@ -17,9 +18,9 @@ const field = (px: [number, number, number][]): LevelField => {
   return { width: 512, height: 512, data };
 };
 
-describe("homePixel", () => {
+describe("pointPixel", () => {
   it("puts home inside the IDR504 frame with a ~250 m pixel", () => {
-    const { x, y, rPx } = homePixel(g504);
+    const { x, y, rPx } = pointPixel(g504, CALVERT);
     expect(x).toBeGreaterThan(204.8);
     expect(x).toBeLessThan(307.2);
     expect(y).toBeGreaterThan(204.8);
@@ -41,18 +42,21 @@ describe("maxLevelInDisc", () => {
   });
 });
 
+// The point is Brisbane, not CALVERT: nothing in sampling may assume the point is the fixed home.
+const P = { lat: -27.4698, lon: 153.0251 };
+
 // IDR083 is an 8-bit frame, IDR063 a 4-bit one (both real BOM frames).
-describe.each(["IDR083-sample.png", "IDR063-4bit-sample.png"])("sampleHomeFromPng %s", (file) => {
+describe.each(["IDR083-sample.png", "IDR063-4bit-sample.png"])("samplePointFromPng %s", (file) => {
   const png = new Uint8Array((readFileSync as (u: URL) => Uint8Array)(new URL(`./__fixtures__/${file}`, import.meta.url)));
   const f = decodeFrame(png);
 
-  it("equals maxLevelInDisc(decodeFrame) with home placed on rain", async () => {
+  it("equals maxLevelInDisc(decodeFrame) with the point placed on rain", async () => {
     const at = f.data.findIndex((v, i) => i > 16 * 512 && v > 0);
     const [tx, ty] = [at % 512, Math.floor(at / 512)];
-    // A 0.2 degree box puts ~40 px under the 1 km disc, with home landing on (tx, ty).
+    // A 0.2 degree box puts ~40 px under the 1 km disc, with the point landing on (tx, ty).
     const W = 0.2;
-    const west = HOME.lon - (tx / 512) * W;
-    const north = HOME.lat + (ty / 512) * W;
+    const west = P.lon - (tx / 512) * W;
+    const north = P.lat + (ty / 512) * W;
     const g: RadarGeometry = {
       ...g504,
       centre: { lon: west + W / 2, lat: north - W / 2 },
@@ -63,9 +67,9 @@ describe.each(["IDR083-sample.png", "IDR063-4bit-sample.png"])("sampleHomeFromPn
         br: { lon: west + W, lat: north - W },
       },
     };
-    const { x, y, rPx } = homePixel(g);
+    const { x, y, rPx } = pointPixel(g, P);
     const expected = maxLevelInDisc(f, x, y, rPx, 2);
     expect(expected).toBeGreaterThan(0);
-    expect(await sampleHomeFromPng(png, g)).toBe(expected);
+    expect(await samplePointFromPng(png, g, P)).toBe(expected);
   });
 });

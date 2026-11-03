@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { parseMapFile } from "../../worker/mapFile";
-import { HOME } from "../../shared/config";
 import { frameBounds, uvToLonLat, type Bounds } from "../../shared/gnomonic";
 import { neededRanges } from "./neededRanges";
 import m501 from "../../shared/__fixtures__/IDR501.map?raw";
 import m502 from "../../shared/__fixtures__/IDR502.map?raw";
 import m503 from "../../worker/__fixtures__/IDR503.map?raw";
 import m504 from "../../shared/__fixtures__/IDR504.map?raw";
+
+const CALVERT = { lat: -27.67217111736596, lon: 152.49661614726207 };
 
 const [g501, g502, g503, g504] = [m501, m502, m503, m504].map(parseMapFile) as [
   ReturnType<typeof parseMapFile>, ReturnType<typeof parseMapFile>,
@@ -22,8 +23,8 @@ function box(lon: number, lat: number, km: number): Bounds {
 }
 
 describe("neededRanges", () => {
-  it("needs only the finest range for a small view around HOME", () => {
-    expect(neededRanges(box(HOME.lon, HOME.lat, 20), finestFirst)).toEqual(["IDR504"]);
+  it("needs only the finest range for a small view around CALVERT", () => {
+    expect(neededRanges(box(CALVERT.lon, CALVERT.lat, 20), finestFirst)).toEqual(["IDR504"]);
   });
 
   it("needs every range that shows somewhere when the view is the 128 km frame's bounds", () => {

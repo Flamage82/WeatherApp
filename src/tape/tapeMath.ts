@@ -4,10 +4,13 @@ import { stampToMs } from "../../shared/stamps";
 export const DEFAULT_SPAN_MS = 2_400_000;
 export const MIN_SPAN_MS = 1_200_000;
 export const MAX_SPAN_MS = 604_800_000;
-/** Above this span the graph uses the server's per-frame series instead of the interpolated one. */
+/** Above this span the graph uses one level per frame, sampled on the phone (`LongSeries`), instead of the interpolated series. */
 export const SERIES_SOURCE_SWITCH_MS = 10_800_000;
 /** Step of the interpolated home series. */
 export const SERIES_STEP_MS = 30_000;
+
+/** One frame's rain level (0..15) at the tape's point: its `YYYYMMDDHHMM` UTC stamp and the level. */
+export type SeriesPoint = [stamp: string, level: number];
 
 /** A column with no point inside takes the nearest point's level if it's at most this far away. */
 const NEAREST_MS = 600_000;
@@ -45,7 +48,7 @@ export function flingStep(v: number, dtMs: number, minV = FLING_MIN_V): number {
  * it; with none inside, the nearest point's level if within 10 min of the column centre, else NaN.
  */
 export function seriesToColumns(
-  points: [stamp: string, level: number][], fromMs: number, toMs: number, columns: number,
+  points: SeriesPoint[], fromMs: number, toMs: number, columns: number,
 ): Float32Array {
   const out = new Float32Array(columns).fill(NaN);
   const ms = points.map(([s]) => stampToMs(s));

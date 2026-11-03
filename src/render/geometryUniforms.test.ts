@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { parseMapFile } from "../../worker/mapFile";
-import { HOME } from "../../shared/config";
 import { lonLatToUV, uvToLonLat } from "../../shared/gnomonic";
 import m503 from "../../worker/__fixtures__/IDR503.map?raw";
 import m501 from "../../shared/__fixtures__/IDR501.map?raw";
@@ -8,15 +7,17 @@ import {
   gnomonicUniforms, lonLatToMerc, mercQuad, mercToLonLat, mercToUV, unionQuad, uvToPixel,
 } from "./geometryUniforms";
 
+const CALVERT = { lat: -27.67217111736596, lon: 152.49661614726207 };
+
 const g503 = parseMapFile(m503);
 const g501 = parseMapFile(m501);
 
 describe("shader projection mirror", () => {
   it("lonLatToMerc / mercToLonLat round-trip", () => {
-    const m = lonLatToMerc(HOME.lon, HOME.lat);
+    const m = lonLatToMerc(CALVERT.lon, CALVERT.lat);
     const p = mercToLonLat(m.x, m.y);
-    expect(p.lon).toBeCloseTo(HOME.lon, 9);
-    expect(p.lat).toBeCloseTo(HOME.lat, 9);
+    expect(p.lon).toBeCloseTo(CALVERT.lon, 9);
+    expect(p.lat).toBeCloseTo(CALVERT.lat, 9);
   });
 
   it("Mercator -> uv agrees with shared lonLatToUV across the frame", () => {

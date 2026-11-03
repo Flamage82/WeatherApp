@@ -3,12 +3,15 @@ import type { ProductId } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
 import { msToStamp, stampToMs } from "../../shared/stamps";
 import type { Manifest, RadarGeometry } from "../../shared/types";
+import { BRISBANE } from "../location/location";
 import type { FlowField } from "../motion/flow";
+import type { RadarName } from "./chooseRadar";
 import { DECODED_CAP_MS, FrameStore, OUTER_DECODED_CAP_MS, type FrameStoreDeps } from "./frameStore";
 
 const MIN = 60_000;
 const H = 3_600_000;
 const STEP = 5 * MIN;
+const CALVERT = { lat: -27.67217111736596, lon: 152.49661614726207 };
 /** Newest frame of every product in the default fakes. */
 const NEWEST = Date.UTC(2026, 9, 28, 3, 0);
 
@@ -35,6 +38,8 @@ type FakeOpts = {
    * "dry": the same field with no valid cell, as `computeFlow` gives when no rain matched.
    */
   validFlows?: boolean | "dry";
+  /** The store's initial location (default Calvert, automatic radar). */
+  location?: { point: { lat: number; lon: number }; override: RadarName | null };
 };
 
 function fakes(opts: FakeOpts = {}) {
@@ -56,7 +61,7 @@ function fakes(opts: FakeOpts = {}) {
     fetchFrame: vi.fn(async (p: ProductId, stamp: string) => new TextEncoder().encode(`${p}/${stamp}`)),
     fetchMeta: vi.fn(async (p: ProductId): Promise<RadarGeometry> => ({
       product: p, name: p, centre: { lat: -27.7, lon: 152.7 },
-      corners: { bl: { lon: 152, lat: -28 }, tl: { lon: 152, lat: -27 }, tr: { lon: 153, lat: -27 }, br: { lon: 153, lat: -28 } },
+      corners: { bl: { lon: 152, lat: -28 }, tl: { lon: 152, lat: -27 }, tr: { lon: 154, lat: -27 }, br: { lon: 154, lat: -28 } },
     })),
     fetchDay: vi.fn(async (p: ProductId, day: string): Promise<string[]> => {
       if (state.emptyDays.has(day)) return [];
@@ -85,7 +90,9 @@ function fakes(opts: FakeOpts = {}) {
         stats.maxInFlight = Math.max(stats.maxInFlight, gate.length);
       })
       : Promise.resolve(zero()));
-  const deps: FrameStoreDeps = { api, decode, flow, now: () => state.now };
+  const deps: FrameStoreDeps = {
+    api, decode, flow, now: () => state.now, location: opts.location ?? { point: CALVERT, override: null },
+  };
   return { state, api, decode, flow, gate, stats, deps };
 }
 
@@ -533,8 +540,11 @@ describe("FrameStore nested nowcast", () => {
   });
 
   it("stops using a motion source whose newest frame is more than MAX_FLOW_GAP_MS behind", async () => {
-    const stale = stampsBetween(NEWEST - 24 * H, NEWEST - 20 * MIN); // IDR503 stalled 20 min ago
-    const { store } = await started({ validFlows: true, manifest: { IDR503: stale } });
+    // IDR503 stalled 20 min ago. It is Marburg's check product, so `now` is NEWEST to keep it just fresh
+    // enough (20 min) for the radar to stay.
+    const stale = stampsBetween(NEWEST - 24 * H, NEWEST - 20 * MIN);
+    const { store } = await started({ validFlows: true, manifest: { IDR503: stale }, now: NEWEST });
+    expect(store.radar).toBe("marburg");
     expect(store.getPair("IDR504", NEWEST + 10 * MIN)!.motionFrom).toBe("IDR504");
   });
 
@@ -624,10 +634,11 @@ describe("FrameStore products and radar switching", () => {
     const stale = NEWEST - 25 * MIN;
     const { api, state, store } = await started({ newest: { marburg: stale } });
     expect(store.radar).toBe("stapylton");
-    expect(new Set(frameCalls(api).map((c) => c.p))).toEqual(new Set(["IDR663", "IDR662"]));
-    expect(store.tapeProducts()).toEqual(["IDR663", "IDR662"]);
+    expect(new Set(frameCalls(api).map((c) => c.p))).toEqual(new Set(["IDR664", "IDR663"]));
+    expect(store.fallback).toBe(true);
+    expect(store.tapeProducts()).toEqual(["IDR664", "IDR663"]);
     expect(store.geometries().map((g) => g.product)).toEqual(["IDR661", "IDR662", "IDR663", "IDR664"]);
-    expect(store.getPair("IDR663", NEWEST - MIN)).not.toBeNull();
+    expect(store.getPair("IDR664", NEWEST - MIN)).not.toBeNull();
 
     state.newest.marburg = NEWEST;
     api.fetchFrame.mockClear();
@@ -635,8 +646,42 @@ describe("FrameStore products and radar switching", () => {
     await store.idle();
     expect(store.radar).toBe("marburg");
     expect(new Set(frameCalls(api).map((c) => c.p))).toEqual(new Set(["IDR504", "IDR503"]));
-    expect(store.getPair("IDR663", NEWEST - MIN)).toBeNull();
-    expect(store.decoded("IDR663")).toEqual([]);
+    expect(store.fallback).toBe(false);
+    expect(store.getPair("IDR664", NEWEST - MIN)).toBeNull();
+    expect(store.decoded("IDR664")).toEqual([]);
     expect(store.geometries().map((g) => g.product)).toEqual(["IDR501", "IDR502", "IDR503", "IDR504"]);
+  });
+
+  it("setLocation to BRISBANE switches to Stapylton, tape product IDR664", async () => {
+    const { store } = await started();
+    expect(store.radar).toBe("marburg");
+    expect(store.tapeProduct).toBe("IDR504");
+    store.setLocation(BRISBANE, null);
+    await store.idle();
+    expect(store.radar).toBe("stapylton");
+    expect(store.tapeProduct).toBe("IDR664");
+    expect(store.location).toEqual(BRISBANE);
+    expect(store.getPair("IDR664", NEWEST - MIN)).not.toBeNull();
+  });
+
+  it("setLocation called twice while a refresh is in flight ends on the second location", async () => {
+    const f = fakes({ location: { point: BRISBANE, override: null } });
+    store = new FrameStore(f.deps);
+    void store.start(); // the first refresh starts under Brisbane
+    store.setLocation(BRISBANE, null);
+    store.setLocation(CALVERT, null);
+    await store.idle();
+    expect(store.radar).toBe("marburg");
+    expect(store.tapeProduct).toBe("IDR504");
+    expect(store.location).toEqual(CALVERT);
+  });
+
+  it("override marburg at BRISBANE stays on marburg when Marburg is stale", async () => {
+    const { store } = await started({
+      newest: { marburg: NEWEST - 25 * MIN }, location: { point: BRISBANE, override: "marburg" },
+    });
+    expect(store.radar).toBe("marburg");
+    expect(store.status).toBe("stale");
+    expect(store.fallback).toBe(false);
   });
 });

@@ -1,12 +1,12 @@
 import { useEffect, useRef } from "react";
-import { NOWCAST_MAX_MS, RADARS, type ProductId } from "../../shared/config";
-import { msToStamp } from "../../shared/stamps";
-import type { SeriesDay } from "../../shared/types";
-import { fetchSeries } from "../data/api";
+import { NOWCAST_MAX_MS, type ProductId } from "../../shared/config";
+import { samplePointFromPng } from "../../shared/homeSample";
+import { fetchFrame } from "../data/api";
 import type { FrameStore } from "../data/frameStore";
 import { forecastOpacity } from "../motion/interpolate";
 import { MAX_LEVEL, rampColour } from "../render/colourRamp";
 import { buildHomeForecast, buildHomeSeries } from "./homeSeries";
+import { LongSeries } from "./longSeries";
 import {
   DEFAULT_SPAN_MS, SERIES_SOURCE_SWITCH_MS, SERIES_STEP_MS,
   flingStep, pxToMs, seriesToColumns, tickStepMs, zoomSpan,
@@ -26,11 +26,9 @@ const FRAME_MS = 1000 / 60;
 /** Brisbane is UTC+10 all year (no DST), so label ticks align on local midnight with a fixed offset. */
 const BRISBANE_OFFSET_MS = 36_000_000;
 const DAY_MS = 86_400_000;
-/** Cached series days refetched when a new frame arrives: the newest frame's day, and the day before it for this long. */
-const DAY_SETTLE_MS = 10_800_000;
-/** A failed series day is retried after this. */
-const SERIES_RETRY_MS = 30_000;
 const HATCH_PX = 6;
+/** While long-span frames are still loading the hatch drifts this fast (px per ms, 6 px/s), so "loading" differs from "no data". */
+const HATCH_DRIFT_PX_PER_MS = 0.006;
 /** Background of the nowcast section: a cool violet, distinct from the past (the tape's panel is dark in both themes). */
 const FORECAST_TINT = "rgba(167,139,250,0.16)";
 
@@ -45,8 +43,6 @@ function tickLabel(ms: number, stepMs: number): string {
   if ((ms + BRISBANE_OFFSET_MS) % DAY_MS === 0) return fmtDate.format(ms);
   return stepMs >= 21_600_000 ? `${fmtDate.format(ms)} ${time}` : time;
 }
-
-const dayOf = (ms: number) => msToStamp(ms).slice(0, 8);
 
 type HomeSeries = { product: ProductId; fromMs: number; values: Float32Array };
 
@@ -76,11 +72,12 @@ type Props = {
  * The tape (spec §6.2): a 64 px strip scrolling under a fixed centre playhead, drawing rain at home over
  * time in the map's colours. Drag (with fling) or wheel to scrub; pinch or Ctrl/⌘ + wheel to zoom about
  * the playhead; double-tap resets the span. Its source is the active radar's tape product, whatever the
- * map shows: up to 3 h of span the interpolated 30 s series from the decoded pairs (`buildHomeSeries`),
- * above that the server's per-frame series (`fetchSeries`, one UTC day file each, cached). Where neither
- * has a value yet the tape shows a faint hatch. Past the newest frame ("now") comes the nowcast, up to
- * NOWCAST_MAX_MS: a tinted section whose graph is the client nowcast at home (`buildHomeForecast`, at any
- * span), faded as the map fades it. Beyond that the tape is shaded.
+ * map shows, read at the store's location: up to 3 h of span the interpolated 30 s series from the decoded
+ * pairs (`buildHomeSeries`), above that one level per frame that the phone samples itself from the
+ * (cached) frame PNGs (`LongSeries`). Where there's no value yet the tape shows a faint hatch, drifting
+ * while long-span frames are still loading. Past the newest frame ("now") comes the nowcast, up to
+ * NOWCAST_MAX_MS: a tinted section whose graph is the client nowcast at the location (`buildHomeForecast`,
+ * at any span), faded as the map fades it. Beyond that the tape is shaded.
  */
 export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -98,47 +95,18 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
     let raf = 0;
     let home: HomeSeries | null = null;
     let homeDirty = true;
-    /** Series points per `product/day`; null while the first fetch is in flight. */
-    const days = new Map<string, SeriesDay["points"] | null>();
-    const inFlight = new Set<string>();
-    let lastNewest = store.newestMs;
+    const long = new LongSeries({
+      fetchFrame, sample: samplePointFromPng, onUpdate: () => requestDraw.current(),
+    });
 
-    const tapeProduct = (): ProductId | null => (store.radar ? RADARS[store.radar].tapeProduct : null);
-
-    function loadDay(p: ProductId, day: string): void {
-      const key = `${p}/${day}`;
-      if (inFlight.has(key)) return;
-      inFlight.add(key);
-      if (!days.has(key)) days.set(key, null);
-      fetchSeries(p, day).then(
-        (s) => {
-          days.set(key, s.points);
-          requestDraw.current();
-        },
-        (e: unknown) => {
-          console.warn(`series ${key} failed`, e);
-          if (days.get(key) === null) setTimeout(() => days.get(key) === null && days.delete(key), SERIES_RETRY_MS);
-        },
-      ).finally(() => inFlight.delete(key));
-    }
-
-    /** Points from the cached day files covering [fromMs, toMs]; starts fetching any day not cached yet. */
-    function dayPoints(p: ProductId, fromMs: number, toMs: number): SeriesDay["points"] {
-      const out: SeriesDay["points"] = [];
-      for (let d = Math.floor(fromMs / DAY_MS) * DAY_MS; d <= toMs; d += DAY_MS) {
-        const day = dayOf(d), pts = days.get(`${p}/${day}`);
-        if (pts === undefined) loadDay(p, day);
-        else if (pts) for (const x of pts) out.push(x);
-      }
-      return out;
-    }
+    const tapeProduct = (): ProductId | null => store.tapeProduct;
 
     function ensureHome(p: ProductId): void {
       if (!homeDirty && home?.product === p) return;
       homeDirty = false;
       const geom = store.geometry(p), dec = store.decoded(p);
       home = geom && dec.length >= 2
-        ? { product: p, fromMs: dec[0]!, values: buildHomeSeries(store, p, geom, dec[0]!, dec[dec.length - 1]!) }
+        ? { product: p, fromMs: dec[0]!, values: buildHomeSeries(store, p, geom, store.location, dec[0]!, dec[dec.length - 1]!) }
         : null;
     }
 
@@ -167,14 +135,21 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
       const dataEnd = pFrames.length ? pFrames[pFrames.length - 1]! : end;
 
       let levels: Float32Array = new Float32Array(cols).fill(NaN);
+      let loading = false;
+      if (!p || span <= SERIES_SOURCE_SWITCH_MS) long.cancel(); // zoomed back in: stop fetching frames nobody sees
       if (p && span <= SERIES_SOURCE_SWITCH_MS) {
         ensureHome(p);
         if (home) for (let c = 0; c < cols; c++) levels[c] = homeLevel(home, from + (c + 0.5) * colMs);
       } else if (p) {
-        levels = seriesToColumns(dayPoints(p, from - colMs, Math.min(to, end) + colMs), from, to, cols);
+        const geom = store.geometry(p);
+        if (geom) {
+          const r = long.points(p, geom, store.location, pFrames, from - colMs, Math.min(to, end) + colMs, t);
+          levels = seriesToColumns(r.points, from, to, cols);
+          loading = r.pending;
+        }
       }
       // Nowcast columns, at any span.
-      const fc = p && to > dataEnd ? buildHomeForecast(store, store.tapeProducts()) : null;
+      const fc = p && to > dataEnd ? buildHomeForecast(store, store.tapeProducts(), store.location) : null;
       for (let c = 0; c < cols; c++) {
         const tc = from + (c + 0.5) * colMs;
         if (tc > dataEnd) levels[c] = fc ? homeLevel(fc, tc) : NaN;
@@ -188,7 +163,8 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
       }
 
       // Graph, and a hatch (scrolling with the tape) where there's no value yet. Nothing after the nowcast.
-      hatch?.setTransform(new DOMMatrix([1, 0, 0, 1, xOf(0) % HATCH_PX, 0]));
+      const drift = loading ? performance.now() * HATCH_DRIFT_PX_PER_MS : 0;
+      hatch?.setTransform(new DOMMatrix([1, 0, 0, 1, (xOf(0) + drift) % HATCH_PX, 0]));
       let hatchFrom = -1;
       const flushHatch = (c: number) => {
         if (hatchFrom < 0 || !hatch) return;
@@ -225,6 +201,8 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
         ctx.fillRect(xOf(end), 0, 1, graphH);
       }
 
+      if (loading) requestDraw.current(); // keep the hatch drifting, and the frames coming, until it's all in
+
       // Ticks and labels on local (Brisbane) multiples of the step; a label that would overlap is skipped.
       const step = tickStepMs(span);
       ctx.font = "11px system-ui, sans-serif";
@@ -253,16 +231,6 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
 
     const onChange = () => {
       homeDirty = true;
-      // A new frame: refetch the cached series days it could have added to.
-      if (store.newestMs !== lastNewest && store.newestMs !== null) {
-        lastNewest = store.newestMs;
-        const p = tapeProduct();
-        if (p) {
-          for (const day of new Set([dayOf(lastNewest), dayOf(lastNewest - DAY_SETTLE_MS)])) {
-            if (days.get(`${p}/${day}`)) loadDay(p, day);
-          }
-        }
-      }
       requestDraw.current();
     };
     store.addEventListener("change", onChange);
@@ -409,6 +377,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
 
     return () => {
       store.removeEventListener("change", onChange);
+      long.cancel();
       ro.disconnect();
       cancelAnimationFrame(raf);
       stopFling();

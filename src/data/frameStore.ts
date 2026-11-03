@@ -5,10 +5,12 @@ import {
 import type { LevelField } from "../../shared/decodeFrame";
 import { IDENTITY_AFFINE, pixelAffine, type PixelAffine } from "../../shared/gnomonic";
 import { msToStamp, stampToMs } from "../../shared/stamps";
-import type { Manifest, RadarGeometry } from "../../shared/types";
+import type { LatLon, Manifest, RadarGeometry } from "../../shared/types";
+import { nearestRadar } from "../location/location";
 import { FORECAST_PAIRS, forecastFlow, type FlowField } from "../motion/flow";
 import { locate } from "../time/timeline";
 import { chooseRadar, type RadarName } from "./chooseRadar";
+import { chooseTapeProduct } from "./tapeProduct";
 
 /** Decoded frames + flows kept for the tape product: a window this long around the playhead (spec §6.4). */
 export const DECODED_CAP_MS = 21_600_000;
@@ -38,6 +40,8 @@ export type FrameStoreDeps = {
   decode(png: Uint8Array): LevelField;
   flow(a: LevelField, b: LevelField, gapMs: number): Promise<FlowField>;
   now(): number;
+  /** The initial location; `setLocation` moves it. `override` is a radar chosen by hand, if any. */
+  location: { point: LatLon; override: RadarName | null };
 };
 
 /**
@@ -111,10 +115,14 @@ function indexOf(arr: number[], x: number): number {
 /**
  * Browser-side frame store for one radar at a time (spec §6.4, §7.5, §7.6).
  *
- * - **Radar:** each refresh picks the radar with `chooseRadar` from both radars' tape-product
- *   manifests. When it changes, the whole store switches: every product, decoded frame, flow and day
- *   listing of the old radar is dropped (radars are never mixed). The requested time range and the
- *   playhead focus carry over.
+ * - **Location and radar:** each refresh picks the radar with `chooseRadar` from both radars' check-product
+ *   manifests, preferring the one nearer the location (or the one chosen by hand, `setLocation`). When it
+ *   changes, the whole store switches: every product, decoded frame, flow and day listing of the old radar
+ *   is dropped (radars are never mixed). The requested time range and the playhead focus carry over.
+ * - **Tape product:** the finest range of the radar whose frame holds the location's 1 km disc
+ *   (`chooseTapeProduct`). The location, radar and tape product change together, at the end of a refresh,
+ *   so what a reader sees (`location`, `radar`, `tapeProduct`) is always one consistent set. A location
+ *   set while a refresh runs gets a second refresh straight after it.
  * - **Known stamps** come from each product's manifest (last 24 h) and, further back, from
  *   `fetchDay`, one UTC day at a time, newest first, down to the server's earliest stamp
  *   (`fetchEarliest`). Empty days inside the archive (outages) are crossed, not taken as its end.
@@ -141,13 +149,21 @@ export class FrameStore extends EventTarget {
   radar: RadarName | null = null;
   status: "ok" | "stale" | "empty" = "empty";
   newestMs: number | null = null;
+  /** True while the radar in use isn't the preferred one (the preferred one was stale, the other fresh). */
+  fallback = false;
 
   private readonly deps: FrameStoreDeps;
   private gen = 0;
   private products = new Map<ProductId, ProductState>();
   private metas = new Map<ProductId, RadarGeometry>();
-  private metaLoading = new Set<ProductId>();
-  private lastTape: { marburg: Manifest | null; stapylton: Manifest | null } = { marburg: null, stapylton: null };
+  private metaLoading = new Map<ProductId, Promise<void>>();
+  private lastCheck: { marburg: Manifest | null; stapylton: Manifest | null } = { marburg: null, stapylton: null };
+  /** The location asked for, and the one applied (with `radar` and `tapeProd`) by the last refresh. */
+  private wanted: LatLon;
+  private point: LatLon;
+  private override: RadarName | null;
+  private tapeProd: ProductId | null = null;
+  private locationChanged = false;
   private affines = new Map<string, PixelAffine>();
   /**
    * Ranges the view needs (`setNeeded`), beyond the tape product and its nowcast support. Kept as given
@@ -172,6 +188,18 @@ export class FrameStore extends EventTarget {
   constructor(deps: FrameStoreDeps) {
     super();
     this.deps = deps;
+    this.wanted = this.point = deps.location.point;
+    this.override = deps.location.override;
+  }
+
+  /** The location the tape and the hint read: the one applied by the last refresh. */
+  get location(): LatLon {
+    return this.point;
+  }
+
+  /** The tape product, or null before a radar is chosen. */
+  get tapeProduct(): ProductId | null {
+    return this.tapeProd;
   }
 
   // ---- lifecycle -------------------------------------------------------------------------------
@@ -216,11 +244,30 @@ export class FrameStore extends EventTarget {
   /** Re-reads the manifests: may switch radar, learns new stamps and loads their frames. */
   refresh(): Promise<void> {
     if (!this.refreshing) {
-      this.refreshing = this.track(this.doRefresh()).finally(() => {
+      this.refreshing = this.track(this.refreshWhileChanged()).finally(() => {
         this.refreshing = null;
       });
     }
     return this.refreshing;
+  }
+
+  /**
+   * Moves the location (and the radar chosen by hand, or null for the nearer one) and refreshes. If a
+   * refresh is already running, one more runs straight after it, so the final state is the last call's.
+   */
+  setLocation(point: LatLon, override: RadarName | null): void {
+    this.wanted = point;
+    this.override = override;
+    this.locationChanged = true;
+    this.emit();
+    void this.refresh();
+  }
+
+  private async refreshWhileChanged(): Promise<void> {
+    do {
+      this.locationChanged = false;
+      await this.doRefresh();
+    } while (this.locationChanged && !this.stopped);
   }
 
   /**
@@ -250,22 +297,23 @@ export class FrameStore extends EventTarget {
    * supplies the rain from outside the tape range's frame (spec §5, §6). Empty before a radar is chosen.
    */
   tapeProducts(): ProductId[] {
-    return this.radar ? FrameStore.tapeSet(this.radar) : [];
+    return this.radar && this.tapeProd ? this.tapeSet() : [];
   }
 
-  private static tapeSet(radar: RadarName): ProductId[] {
-    const { products, tapeProduct } = RADARS[radar];
-    const coarser = products[products.indexOf(tapeProduct) - 1];
-    return [...new Set([tapeProduct, NOWCAST_MOTION[tapeProduct], ...(coarser ? [coarser] : [])])];
+  private tapeSet(): ProductId[] {
+    const tape = this.tapeProd!;
+    const { products } = RADARS[this.radar!];
+    const coarser = products[products.indexOf(tape) - 1];
+    return [...new Set([tape, NOWCAST_MOTION[tape], ...(coarser ? [coarser] : [])])];
   }
 
   private isTape(p: ProductId): boolean {
-    return p === RADARS[this.radar!].tapeProduct;
+    return p === this.tapeProd;
   }
 
   /** A nowcast support range (not the tape product): its newest frames are always kept. */
   private isSupport(p: ProductId): boolean {
-    return !this.isTape(p) && FrameStore.tapeSet(this.radar!).includes(p);
+    return !this.isTape(p) && this.tapeSet().includes(p);
   }
 
   /** The tape product or a needed range: its stamps are learnt back to the requested start. */
@@ -390,7 +438,7 @@ export class FrameStore extends EventTarget {
    */
   loadedWindow(): { start: number; end: number } {
     let start = Infinity, end = -Infinity;
-    const tape = this.radar ? RADARS[this.radar].tapeProduct : null;
+    const tape = this.tapeProd;
     const ps = tape && this.frames(tape).length > 0 ? [tape] : [...this.products.keys()];
     for (const p of ps) {
       const fr = this.frames(p);
@@ -425,18 +473,22 @@ export class FrameStore extends EventTarget {
 
   private async doRefresh(): Promise<void> {
     const { api, now } = this.deps;
+    const point = this.wanted, override = this.override;
     const get = (p: ProductId) => api.fetchManifest(p).catch((e: unknown) => {
       console.warn(`manifest ${p} failed`, e);
       return null;
     });
-    const [mb, st] = await Promise.all([get(RADARS.marburg.tapeProduct), get(RADARS.stapylton.tapeProduct)]);
+    const [mb, st] = await Promise.all([get(RADARS.marburg.checkProduct), get(RADARS.stapylton.checkProduct)]);
     if (this.stopped) return;
     // A failed fetch keeps the last manifest, so one network blip doesn't switch radar.
-    this.lastTape = { marburg: mb ?? this.lastTape.marburg, stapylton: st ?? this.lastTape.stapylton };
-    const choice = chooseRadar(this.lastTape, now());
+    this.lastCheck = { marburg: mb ?? this.lastCheck.marburg, stapylton: st ?? this.lastCheck.stapylton };
+    const choice = chooseRadar(this.lastCheck, now(), { radar: override ?? nearestRadar(point), manual: override !== null });
 
     if (choice.radar !== this.radar) this.switchRadar(choice.radar);
+    this.point = point;
+    this.retarget();
     const g = this.gen;
+    this.fallback = choice.fallback;
     this.status = choice.status;
     this.newestMs = choice.newestMs;
     this.emit();
@@ -448,16 +500,19 @@ export class FrameStore extends EventTarget {
       this.invalidateFrames();
     }
     const radar = choice.radar;
-    this.ensureMetas(radar);
-    for (const p of [...FrameStore.tapeSet(radar), ...this.needed]) {
+    // The tape product is picked from real geometry, so wait for the radar's metas before creating products.
+    await this.ensureMetas(radar);
+    if (g !== this.gen) return;
+    this.retarget();
+    for (const p of [...this.tapeSet(), ...this.needed]) {
       if (RADARS[radar].products.includes(p) && !this.products.has(p)) this.newProduct(p);
     }
-    const tape = RADARS[radar].tapeProduct;
-    const tapeManifest = radar === "marburg" ? mb : st;
+    const checkProduct = RADARS[radar].checkProduct;
+    const checkManifest = radar === "marburg" ? mb : st;
     const all = [...this.products.values()];
     // Merge every product's manifest before scheduling, so loads go newest-first across products
     // (the map's newest pair comes first, not the whole tape product).
-    const ms = await Promise.all(all.map((ps) => (ps.p === tape && tapeManifest ? tapeManifest : this.manifestOf(ps.p))));
+    const ms = await Promise.all(all.map((ps) => (ps.p === checkProduct && checkManifest ? checkManifest : this.manifestOf(ps.p))));
     if (g !== this.gen) return;
     all.forEach((ps, k) => {
       ps.failed.clear();
@@ -468,6 +523,14 @@ export class FrameStore extends EventTarget {
     await Promise.all(all.map((ps) => this.learnAndSchedule(ps, g)));
   }
 
+  /** The tape product for the applied location on the active radar, from the geometries loaded so far. */
+  private retarget(): void {
+    const next = this.radar ? chooseTapeProduct(this.radar, this.point, (p) => this.metas.get(p) ?? null) : null;
+    if (next === this.tapeProd) return;
+    this.tapeProd = next;
+    this.emit();
+  }
+
   private switchRadar(radar: RadarName): void {
     this.gen++;
     this.radar = radar;
@@ -476,20 +539,27 @@ export class FrameStore extends EventTarget {
     this.invalidateFrames();
   }
 
-  private ensureMetas(radar: RadarName): void {
+  /** Starts every missing geometry of the radar. Resolves once they have all settled (a failed one is retried next refresh). */
+  private async ensureMetas(radar: RadarName): Promise<void> {
+    const loading: Promise<void>[] = [];
     for (const p of RADARS[radar].products) {
-      if (this.metas.has(p) || this.metaLoading.has(p)) continue;
-      this.metaLoading.add(p);
-      this.track(
-        this.deps.api.fetchMeta(p).then(
-          (g) => {
-            this.metas.set(p, g);
-            this.emit();
-          },
-          (e: unknown) => console.warn(`meta ${p} failed`, e),
-        ).finally(() => this.metaLoading.delete(p)),
-      );
+      if (this.metas.has(p)) continue;
+      let req = this.metaLoading.get(p);
+      if (!req) {
+        req = this.track(
+          this.deps.api.fetchMeta(p).then(
+            (g) => {
+              this.metas.set(p, g);
+              this.emit();
+            },
+            (e: unknown) => console.warn(`meta ${p} failed`, e),
+          ).finally(() => this.metaLoading.delete(p)),
+        );
+        this.metaLoading.set(p, req);
+      }
+      loading.push(req);
     }
+    await Promise.all(loading);
   }
 
   // ---- stamps ----------------------------------------------------------------------------------

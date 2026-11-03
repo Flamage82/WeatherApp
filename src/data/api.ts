@@ -1,5 +1,6 @@
 import type { ProductId } from "../../shared/config";
-import type { Manifest, RadarGeometry, SeriesDay } from "../../shared/types";
+import type { Manifest, RadarGeometry } from "../../shared/types";
+import { cachedGet } from "./frameCache";
 
 /** Every request is abandoned after this, so a hung fetch can't hold up a refresh or a day listing. */
 export const FETCH_TIMEOUT_MS = 15_000;
@@ -25,7 +26,10 @@ export async function fetchManifest(p: ProductId): Promise<Manifest> {
 }
 
 export async function fetchFrame(p: ProductId, stamp: string): Promise<Uint8Array> {
-  return new Uint8Array(await (await getOk(`/api/frame/${p}/${stamp}`)).arrayBuffer());
+  const url = `/api/frame/${p}/${stamp}`;
+  const res = await cachedGet(url, get, Date.now());
+  if (!res.ok) throw new Error(`GET ${url} failed: ${res.status}`);
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 export async function fetchMeta(p: ProductId): Promise<RadarGeometry> {
@@ -40,9 +44,4 @@ export async function fetchEarliest(p: ProductId): Promise<string | null> {
 /** Ascending stamps (YYYYMMDDHHMM) for one UTC day (`day` = YYYYMMDD); `[]` on 404. */
 export async function fetchDay(p: ProductId, day: string): Promise<string[]> {
   return (await getJsonOr404<{ frames: string[] }>(`/api/day/${p}/${day}`))?.frames ?? [];
-}
-
-/** Rain level at home per frame for one UTC day (`day` = YYYYMMDD); no points on 404. */
-export async function fetchSeries(p: ProductId, day: string): Promise<SeriesDay> {
-  return (await getJsonOr404<SeriesDay>(`/api/series/${p}/${day}`)) ?? { product: p, day, points: [] };
 }

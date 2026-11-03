@@ -1,5 +1,4 @@
 import { MANIFEST_SPAN_MS, PRODUCTS, RADARS, type ProductId } from "../shared/config";
-import { sampleHomeFromPng } from "../shared/homeSample";
 import { msToStamp, stampToMs } from "../shared/stamps";
 import type { RadarGeometry } from "../shared/types";
 import type { FtpSource } from "./ftpProtocol";
@@ -81,9 +80,9 @@ async function storedAfter(bucket: BucketLike, product: ProductId, afterStamp: s
  * `state/{radar}.json` is read once and written once, only if changed.
  *
  * `newest[product]` (informational) only moves to the newest listed in-window stamp, and only when every
- * missing in-window frame was stored in this run. A listing error, a failed download or put, or a tape
- * product with no geometry (its frames must carry the home level) leaves it unchanged and stores nothing,
- * so the next run retries.
+ * missing in-window frame was stored in this run. A listing error or a failed download or put leaves it
+ * unchanged, so the next run retries. Frames are stored as they are: sampling rain at a place is the
+ * client's job.
  */
 export async function runIngest(deps: {
   ftp: FtpSource;
@@ -135,41 +134,13 @@ export async function runIngest(deps: {
     const listedNewest = inWindow[inWindow.length - 1];
     let fetched = 0;
 
-    // The tape product's frames carry the rain level at home, which needs the geometry before the first put.
-    const isTape = product === RADARS[radar].tapeProduct;
-    let geometry: RadarGeometry | null = null;
-    if (isTape && refreshMeta) {
-      try {
-        const m = await fetchMeta(ftp, bucket, product, nowMs);
-        geometry = m.geometry;
-        if (m.error) metaError = `meta: ${m.error}`;
-      } catch (e) {
-        metaError = `meta: ${msg(e)}`;
-      }
-    }
-
     if (!frameError && listedNewest) {
       try {
         const stored = await storedAfter(bucket, product, msToStamp(cutoff - 60_000));
         const missing = inWindow.filter((s) => !stored.has(s)).reverse(); // newest first
-        if (isTape && missing.length > 0 && !geometry) {
-          geometry = asGeometry((await (await bucket.get(`meta/${product}.json`))?.json()) as Partial<RadarGeometry> | null);
-          if (!geometry) throw new Error("no geometry");
-        }
         for (const stamp of missing) {
           const bytes = await ftp.retrieve(`/anon/gen/radar/${product}.T.${stamp}.png`);
-          let customMetadata: Record<string, string> | undefined;
-          if (geometry) {
-            try {
-              customMetadata = { home: String(await sampleHomeFromPng(bytes, geometry)) };
-            } catch (e) {
-              report.errors.push(`${product}: home sample ${stamp}: ${msg(e)}`);
-            }
-          }
-          await bucket.put(`frames/${product}/${stamp}.png`, bytes, {
-            httpMetadata: { contentType: "image/png" },
-            ...(customMetadata ? { customMetadata } : {}),
-          });
+          await bucket.put(`frames/${product}/${stamp}.png`, bytes, { httpMetadata: { contentType: "image/png" } });
           fetched++;
         }
         if (fetched === missing.length && (!known || listedNewest > known)) {
@@ -182,7 +153,7 @@ export async function runIngest(deps: {
     }
     report.added[product] = fetched;
 
-    if (refreshMeta && !isTape) {
+    if (refreshMeta) {
       try {
         const m = await fetchMeta(ftp, bucket, product, nowMs);
         if (m.error) metaError = `meta: ${m.error}`;

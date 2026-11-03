@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { parseMapFile } from "../worker/mapFile";
-import { HOME } from "./config";
 import { frameBounds, lonLatToUV, pixelAffine, uvToLonLat } from "./gnomonic";
-import { homePixel } from "./homeSample";
+import { pointPixel } from "./homeSample";
 import m503 from "../worker/__fixtures__/IDR503.map?raw";
 import m504 from "./__fixtures__/IDR504.map?raw";
 import m664 from "./__fixtures__/IDR664.map?raw";
+
+const CALVERT = { lat: -27.67217111736596, lon: 152.49661614726207 };
 
 const g503 = parseMapFile(m503);
 const g504 = parseMapFile(m504);
@@ -35,11 +36,11 @@ describe("gnomonic", () => {
     expect(Math.abs(r.v - 0.5)).toBeLessThan(0.005);
   });
 
-  it("round-trips HOME", () => {
-    const { u, v } = lonLatToUV(g504, HOME.lon, HOME.lat);
+  it("round-trips CALVERT", () => {
+    const { u, v } = lonLatToUV(g504, CALVERT.lon, CALVERT.lat);
     const p = uvToLonLat(g504, u, v);
-    expect(Math.abs(p.lon - HOME.lon)).toBeLessThan(1e-6);
-    expect(Math.abs(p.lat - HOME.lat)).toBeLessThan(1e-6);
+    expect(Math.abs(p.lon - CALVERT.lon)).toBeLessThan(1e-6);
+    expect(Math.abs(p.lat - CALVERT.lat)).toBeLessThan(1e-6);
   });
 
   it("uvToLonLat at the exact centre returns the centre", () => {
@@ -49,8 +50,8 @@ describe("gnomonic", () => {
     expect(p.lat).toBeCloseTo(g504.centre.lat, 8);
   });
 
-  it("HOME is near the middle of IDR504", () => {
-    const { u, v } = lonLatToUV(g504, HOME.lon, HOME.lat);
+  it("CALVERT is near the middle of IDR504", () => {
+    const { u, v } = lonLatToUV(g504, CALVERT.lon, CALVERT.lat);
     expect(u).toBeGreaterThan(0.4);
     expect(u).toBeLessThan(0.6);
     expect(v).toBeGreaterThan(0.4);
@@ -73,13 +74,13 @@ describe("gnomonic", () => {
     const m = pixelAffine(g504, g503);
     expect(Math.abs(m.sx - 0.5005)).toBeLessThan(0.001);
     expect(Math.abs(m.sy - 0.5005)).toBeLessThan(0.001);
-    const h4 = homePixel(g504), h3 = homePixel(g503);
+    const h4 = pointPixel(g504, CALVERT), h3 = pointPixel(g503, CALVERT);
     expect(Math.abs(m.sx * h4.x + m.ox - h3.x)).toBeLessThan(0.05);
     expect(Math.abs(m.sy * h4.y + m.oy - h3.y)).toBeLessThan(0.05);
   });
 
-  it("HOME is outside IDR664's frame (why Stapylton's tape uses IDR663)", () => {
-    const { u, v } = lonLatToUV(g664, HOME.lon, HOME.lat);
+  it("CALVERT is outside IDR664's frame (why Stapylton's tape uses IDR663)", () => {
+    const { u, v } = lonLatToUV(g664, CALVERT.lon, CALVERT.lat);
     const inside = u >= 0 && u <= 1 && v >= 0 && v <= 1;
     expect(inside).toBe(false);
   });

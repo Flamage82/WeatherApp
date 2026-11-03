@@ -3,6 +3,8 @@ import { STALE_WARN_MS, type RadarName } from "../data/chooseRadar";
 type Props = {
   status: "ok" | "stale" | "empty";
   radar: RadarName | null;
+  /** True while the radar in use is the backup for the preferred one. */
+  fallback: boolean;
   /** The newest frame's time; staleness is judged from it alone. */
   newestMs: number | null;
   now: number;
@@ -17,16 +19,16 @@ function age(ms: number): string {
 
 /**
  * Small print under the controls (spec §6.1, §7.6): how old the newest frame is (a warning past
- * STALE_WARN_MS), the radar when on the backup, and the attributions (BOM + base map; MapLibre's own
+ * STALE_WARN_MS), the radar when on the backup (`fallback`), and the attributions (BOM + base map; MapLibre's own
  * attribution control is off).
  */
-export function StatusBar({ status, radar, newestMs, now }: Props) {
+export function StatusBar({ status, radar, fallback, newestMs, now }: Props) {
   const stale = newestMs !== null && now - newestMs > STALE_WARN_MS;
   return (
     <div style={{ textAlign: "center", color: "rgba(230,237,243,0.7)", font: "10px/1.35 system-ui, sans-serif" }}>
       <div data-testid="radar-status" style={{ fontSize: 11, color: stale ? "#fbbf24" : undefined, fontWeight: stale ? 600 : undefined }}>
         {status === "empty" || newestMs === null ? "No radar frames yet" : `${stale ? "⚠ " : ""}updated ${age(now - newestMs)} ago`}
-        {radar === "stapylton" && " · Mt Stapylton radar (backup)"}
+        {fallback && radar && ` · ${radar === "stapylton" ? "Mt Stapylton" : "Marburg"} radar (backup)`}
       </div>
       <div style={{ opacity: 0.75 }}>
         Radar data © Commonwealth of Australia, Bureau of Meteorology ·{" "}

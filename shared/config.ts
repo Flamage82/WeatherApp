@@ -1,4 +1,4 @@
-export const HOME = { lat: -27.67217111736596, lon: 152.49661614726207 };
+import type { LatLon } from "./types";
 
 export type ProductId =
   | "IDR501"
@@ -56,11 +56,17 @@ export const CELL_SIZE: Record<ProductId, CellSize> = {
 
 /** Products are listed widest range to sharpest. */
 export const RADARS: {
-  marburg: { products: ProductId[]; tapeProduct: "IDR504" };
-  stapylton: { products: ProductId[]; tapeProduct: "IDR663" };
+  marburg: { products: ProductId[]; centre: LatLon; checkProduct: ProductId };
+  stapylton: { products: ProductId[]; centre: LatLon; checkProduct: ProductId };
 } = {
-  marburg: { products: ["IDR501", "IDR502", "IDR503", "IDR504"], tapeProduct: "IDR504" },
-  stapylton: { products: ["IDR661", "IDR662", "IDR663", "IDR664"], tapeProduct: "IDR663" },
+  marburg: {
+    products: ["IDR501", "IDR502", "IDR503", "IDR504"],
+    centre: { lat: -27.608, lon: 152.539 }, checkProduct: "IDR503",
+  },
+  stapylton: {
+    products: ["IDR661", "IDR662", "IDR663", "IDR664"],
+    centre: { lat: -27.718, lon: 153.24 }, checkProduct: "IDR663",
+  },
 };
 
 /**
@@ -83,4 +89,4 @@ export const MANIFEST_SPAN_MS = 86_400_000;
 export const DEFAULT_WINDOW_MS = 7_200_000;
 export const MAX_FLOW_GAP_MS = 900_000;
 /** The nowcast runs this far past the newest frame (client-side, spec §9). */
-export const NOWCAST_MAX_MS = 3_600_000;
+export const NOWCAST_MAX_MS = 10_800_000;

@@ -5,7 +5,7 @@ type Props = {
   now: number;
   /** The newest frame: past it the clock shows the nowcast's lead. */
   newestMs: number | null;
-  /** The "rain at home" line (`rainHint`), or null for none. */
+  /** The "rain here" line (`rainHint`), or null for none. */
   hint: string | null;
 };
 

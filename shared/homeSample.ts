@@ -1,8 +1,8 @@
-import { CELL_SIZE, HOME } from "./config";
+import { CELL_SIZE } from "./config";
 import { lonLatToUV } from "./gnomonic";
 import { rgbToLevel } from "./legend";
 import type { LevelField } from "./decodeFrame";
-import type { RadarGeometry } from "./types";
+import type { LatLon, RadarGeometry } from "./types";
 
 export const HOME_RADIUS_M = 1000;
 
@@ -10,9 +10,9 @@ const SIZE = 512;
 const EARTH_R_M = 6_371_008.8;
 const RAD = Math.PI / 180;
 
-/** Home on the 512 grid (pixel-centre convention, pixel i has its centre at i) and the disc radius in pixels. */
-export function homePixel(g: RadarGeometry): { x: number; y: number; rPx: number } {
-  const { u, v } = lonLatToUV(g, HOME.lon, HOME.lat);
+/** A point on the 512 grid (pixel-centre convention, pixel i has its centre at i) and the disc radius in pixels. */
+export function pointPixel(g: RadarGeometry, p: LatLon): { x: number; y: number; rPx: number } {
+  const { u, v } = lonLatToUV(g, p.lon, p.lat);
   const { bl, br } = g.corners;
   const dLat = (br.lat - bl.lat) * RAD;
   const dLon = (br.lon - bl.lon) * RAD;
@@ -89,11 +89,11 @@ async function inflatePrefix(zlib: Uint8Array<ArrayBuffer>, need: number): Promi
 }
 
 /**
- * Worker-side equivalent of `maxLevelInDisc(decodeFrame(png), ...)` around home, without a full decode:
+ * Equivalent of `maxLevelInDisc(decodeFrame(png), ...)` around `p`, without a full decode:
  * inflates and un-filters only the rows down to the bottom of the disc and classifies just its cells.
  * Indexed, non-interlaced 512x512 PNGs only (BOM frames).
  */
-export async function sampleHomeFromPng(png: Uint8Array, g: RadarGeometry): Promise<number> {
+export async function samplePointFromPng(png: Uint8Array, g: RadarGeometry, p: LatLon): Promise<number> {
   const ihdr = chunks(png, "IHDR")[0];
   if (!ihdr) throw new Error("not a PNG");
   const ih = new DataView(ihdr.buffer, ihdr.byteOffset, ihdr.byteLength);
@@ -110,7 +110,7 @@ export async function sampleHomeFromPng(png: Uint8Array, g: RadarGeometry): Prom
     levelOf[i] = alpha === 0 ? 0 : rgbToLevel(plte[i * 3]!, plte[i * 3 + 1]!, plte[i * 3 + 2]!);
   }
 
-  const { x, y, rPx } = homePixel(g);
+  const { x, y, rPx } = pointPixel(g, p);
   const cell = CELL_SIZE[g.product];
   const rowBytes = Math.ceil((SIZE * depth) / 8);
   const stride = rowBytes + 1;
