@@ -2,7 +2,7 @@ import { useRef, type PointerEvent } from "react";
 import { leverToSpeed, speedToLever } from "./leverMath";
 
 const KNOB = 30;
-const LABELS = [4, 2, 0, -2, -4];
+const LABELS = [4, 2, 1, 0, -1, -2, -4];
 
 /** "1×", "1.6×", "−2×"; "0" when paused. */
 export const fmtSpeed = (s: number) =>
@@ -16,7 +16,8 @@ type Props = {
 };
 
 /**
- * The speed lever (spec §6.3): vertical, −4× at the bottom to +4× at the top, with light detents.
+ * The speed lever (spec §6.3): vertical, −4× at the bottom to +4× at the top on a logarithmic-feeling
+ * (exponential) scale so slow speeds near the middle are easy to hit, with light detents.
  * Press or drag anywhere on it (pointer-captured); it stays where it's left.
  */
 export function SpeedLever({ speed, onChange, onHold }: Props) {
