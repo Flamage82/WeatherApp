@@ -63,7 +63,41 @@ const patch = (dx: number, dy: number): LevelField => {
   return f;
 };
 
+/** A 31x31 field, every cell measured, with `fn(cx, cy)` at each cell centre (full-res px). */
+const cellFlow = (fn: (cx: number, cy: number) => [number, number]): FlowField => {
+  const data = new Float32Array(31 * 31 * 2);
+  for (let j = 0; j < 31; j++)
+    for (let i = 0; i < 31; i++) {
+      const [x, y] = fn(16 * i + 16, 16 * j + 16);
+      data[2 * (j * 31 + i)] = x;
+      data[2 * (j * 31 + i) + 1] = y;
+    }
+  return { gw: 31, gh: 31, data, valid: new Uint8Array(31 * 31).fill(1) };
+};
+
 describe("forecastFlow", () => {
+  it("gives a large-scale field equal to a uniform motion", () => {
+    const v = forecastFlow([cellFlow(() => [30, -12])], [300_000]);
+    expect(v.large).toBeDefined();
+    expect(flowAt(v, 256, 256, v.large)[0]).toBeCloseTo(30 / 300_000, 10);
+    expect(flowAt(v, 40, 470, v.large)[1]).toBeCloseTo(-12 / 300_000, 10);
+  });
+
+  it("smooths a short wave out of the large-scale field", () => {
+    const a = 3e-6;
+    const v = forecastFlow([cellFlow((cx) => [0, a * Math.sin((2 * Math.PI * cx) / 64)])], [1]);
+    // cx = 272 is a wave crest (sin(8.5π) = 1): the detailed field keeps it, the large-scale one doesn't.
+    expect(flowAt(v, 272, 256)[1]).toBeCloseTo(a, 9);
+    expect(Math.abs(flowAt(v, 272, 256, v.large)[1])).toBeLessThan(0.1 * a);
+  });
+
+  it("gives zero data and zero large-scale motion when nothing was measured", () => {
+    const dry: FlowField = { gw: 31, gh: 31, data: new Float32Array(31 * 31 * 2), valid: new Uint8Array(31 * 31) };
+    const v = forecastFlow([dry], [300_000]);
+    expect(v.data.every((x) => x === 0)).toBe(true);
+    expect(v.large?.every((x) => x === 0)).toBe(true);
+  });
+
   it("fills a far empty corner with the patch's motion, in px/ms", () => {
     const v = forecastFlow([computeFlow(patch(0, 0), patch(16, 8))], [300_000]);
     for (const [x, y] of [[500, 500], [10, 500], [500, 10]] as const) {

@@ -3,8 +3,10 @@ import type { LevelField } from "../../shared/decodeFrame";
 /**
  * (dx,dy) pairs in full-res px (A -> B) on a gw x gh grid spanning the frame. `valid` (computeFlow
  * only) marks the cells block matching measured, i.e. the ones with rain; the rest are filled in.
+ * `large` (`forecastFlow` only, same layout as `data`) is the smooth large-scale motion the nowcast eases
+ * toward; absent means the same as `data`.
  */
-export type FlowField = { gw: number; gh: number; data: Float32Array; valid?: Uint8Array };
+export type FlowField = { gw: number; gh: number; data: Float32Array; valid?: Uint8Array; large?: Float32Array };
 
 export const ZERO_FLOW: FlowField = { gw: 1, gh: 1, data: new Float32Array(2) };
 
@@ -17,6 +19,8 @@ const SEARCH = 8; // +-8 px on the 128 image = +-32 full-res px
 const MIN_ACTIVE = 6;
 const GRID = (SMALL - BLOCK) / STRIDE + 1; // 31
 const FILL_RADIUS = 3;
+/** Gaussian sigma, in flow cells (about a quarter of the frame), of the large-scale nowcast motion. */
+export const LARGE_SIGMA_CELLS = 8;
 
 function downsample(f: LevelField): Float32Array {
   const out = new Float32Array(SMALL * SMALL);
@@ -152,6 +156,10 @@ export const FORECAST_PAIRS = 3;
  * weighting from all measured cells, with no radius limit (far from rain this tends to the domain
  * mean), so rain keeps moving past its current edge. Flows without a `valid` mask (zero flows for big
  * gaps or errors) count as no data. No motion anywhere gives zero: the rain is drawn stationary.
+ *
+ * The result also carries `large`: a Gaussian-weighted mean (sigma LARGE_SIGMA_CELLS) of only the measured
+ * cells' means, taken before the fill. It is the steering flow of the whole system with the small swirls
+ * averaged out, which the nowcast eases toward over its first hour. Zero when nothing was measured.
  */
 export function forecastFlow(flows: FlowField[], gapsMs: number[]): FlowField {
   const n = GRID * GRID;
@@ -173,7 +181,26 @@ export function forecastFlow(flows: FlowField[], gapsMs: number[]): FlowField {
     out[2 * k] = sx[k]! / cnt[k]!;
     out[2 * k + 1] = sy[k]! / cnt[k]!;
   }
-  if (known.length === 0) return { gw: GRID, gh: GRID, data: out };
+  const large = new Float32Array(n * 2);
+  if (known.length === 0) return { gw: GRID, gh: GRID, data: out, large };
+
+  // g(di, dj) for every cell offset, indexed (dj + GRID - 1) * (2 * GRID - 1) + di + GRID - 1.
+  const span = 2 * GRID - 1;
+  const g = new Float64Array(span * span);
+  for (let dj = -(GRID - 1); dj < GRID; dj++)
+    for (let di = -(GRID - 1); di < GRID; di++)
+      g[(dj + GRID - 1) * span + di + GRID - 1] = Math.exp(-(di * di + dj * dj) / (2 * LARGE_SIGMA_CELLS ** 2));
+  for (let k = 0; k < n; k++) {
+    const i = k % GRID, j = (k - i) / GRID;
+    let sw = 0, wx = 0, wy = 0;
+    for (const m of known) {
+      const w = g[(Math.floor(m / GRID) - j + GRID - 1) * span + (m % GRID) - i + GRID - 1]!;
+      sw += w; wx += w * out[2 * m]!; wy += w * out[2 * m + 1]!;
+    }
+    large[2 * k] = wx / sw;
+    large[2 * k + 1] = wy / sw;
+  }
+
   for (let k = 0; k < n; k++) {
     if (cnt[k]) continue;
     const i = k % GRID, j = (k - i) / GRID;
@@ -186,23 +213,24 @@ export function forecastFlow(flows: FlowField[], gapsMs: number[]): FlowField {
     out[2 * k] = wx / sw;
     out[2 * k + 1] = wy / sw;
   }
-  return { gw: GRID, gh: GRID, data: out };
+  return { gw: GRID, gh: GRID, data: out, large };
 }
 
 /**
- * Bilinear flow lookup at full-res pixel (x, y).
+ * Bilinear flow lookup at full-res pixel (x, y), in `field` (default `f.data`; pass `f.large` for the
+ * large-scale motion).
  * Grid mapping (the GPU shader must match): cell (i, j) of a gw x gh grid is centred at
  *   cx(i) = (i + 1) * 512 / (gw + 1),  cy(j) = (j + 1) * 512 / (gh + 1)
  * which for the 31x31 grid is 16*i + 16 (= block origin 4i + half block 4, times 4).
  * Grid coords gx = x * (gw + 1) / 512 - 1 are clamped to [0, gw-1] (nearest edge value outside).
  */
-export function flowAt(f: FlowField, x: number, y: number): [number, number] {
+export function flowAt(f: FlowField, x: number, y: number, field: Float32Array = f.data): [number, number] {
   const gxr = Math.min(f.gw - 1, Math.max(0, (x * (f.gw + 1)) / FULL - 1));
   const gyr = Math.min(f.gh - 1, Math.max(0, (y * (f.gh + 1)) / FULL - 1));
   const x0 = Math.floor(gxr), y0 = Math.floor(gyr);
   const x1 = Math.min(f.gw - 1, x0 + 1), y1 = Math.min(f.gh - 1, y0 + 1);
   const tx = gxr - x0, ty = gyr - y0;
-  const d = f.data;
+  const d = field;
   const at = (xx: number, yy: number, c: number) => d[(yy * f.gw + xx) * 2 + c]!;
   const lerp = (c: number) =>
     (at(x0, y0, c) * (1 - tx) + at(x1, y0, c) * tx) * (1 - ty) +
