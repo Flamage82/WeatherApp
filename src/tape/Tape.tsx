@@ -174,8 +174,7 @@ export function Tape({ store, t, spanMs, onScrub, onSpanChange, onGesture }: Pro
         levels = seriesToColumns(dayPoints(p, from - colMs, Math.min(to, end) + colMs), from, to, cols);
       }
       // Nowcast columns, at any span.
-      const geom = p && to > dataEnd ? store.geometry(p) : null;
-      const fc = p && geom ? buildHomeForecast(store, p, geom) : null;
+      const fc = p && to > dataEnd ? buildHomeForecast(store, store.tapeProducts()) : null;
       for (let c = 0; c < cols; c++) {
         const tc = from + (c + 0.5) * colMs;
         if (tc > dataEnd) levels[c] = fc ? homeLevel(fc, tc) : NaN;

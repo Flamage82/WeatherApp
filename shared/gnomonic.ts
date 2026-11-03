@@ -56,6 +56,30 @@ export function uvToLonLat(g: RadarGeometry, u: number, v: number): LonLat {
   return { lon: lon * DEG, lat: lat * DEG };
 }
 
+/** Maps `from` pixels to `to` pixels: x' = sx·x + ox, y' = sy·y + oy (pixel-centre convention, pixel i at i). */
+export type PixelAffine = { sx: number; ox: number; sy: number; oy: number };
+
+export const IDENTITY_AFFINE: PixelAffine = { sx: 1, ox: 0, sy: 1, oy: 0 };
+
+/**
+ * The affine map between two ranges' pixel grids. All of a radar's ranges are gnomonic about the same
+ * point, so it is exact up to the BOM corner skew; a third point checks that.
+ */
+export function pixelAffine(from: RadarGeometry, to: RadarGeometry): PixelAffine {
+  const map = (x: number, y: number) => {
+    const p = uvToLonLat(from, (x + 0.5) / 512, (y + 0.5) / 512);
+    const { u, v } = lonLatToUV(to, p.lon, p.lat);
+    return { x: u * 512 - 0.5, y: v * 512 - 0.5 };
+  };
+  const p0 = map(0, 0), p1 = map(511, 511);
+  const sx = (p1.x - p0.x) / 511, sy = (p1.y - p0.y) / 511;
+  const m = { sx, ox: p0.x, sy, oy: p0.y };
+  const p2 = map(100, 400);
+  if (Math.abs(sx * 100 + m.ox - p2.x) > 0.05 || Math.abs(sy * 400 + m.oy - p2.y) > 0.05)
+    throw new Error("pixelAffine: ranges are not affinely related");
+  return m;
+}
+
 /** Lon/lat bounding box of the image. Edges are curved, so sample along them. */
 export function frameBounds(g: RadarGeometry): Bounds {
   const N = 16;

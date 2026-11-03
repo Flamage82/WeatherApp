@@ -4,7 +4,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 // MapLibre finds its worker relative to its own module URL, which Vite's dep pre-bundling moves;
 // point it at the (self-contained) worker file explicitly. Works in dev and in the build.
 import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
-import { HOME, NOWCAST_MAX_MS, RADARS } from "../../shared/config";
+import { HOME, NOWCAST_MAX_MS } from "../../shared/config";
 import { decodeFrame } from "../../shared/decodeFrame";
 import { Clock } from "../controls/Clock";
 import { Legend } from "../controls/Legend";
@@ -117,7 +117,7 @@ export function RadarScreen() {
       flow: flow.compute,
       now: Date.now,
     });
-    const view = new RadarView(map, store, (l) => addRadarLayer(map, l), () => publish());
+    const view = new RadarView(map, store, (l) => addRadarLayer(map, l));
     storeRef.current = store;
     viewRef.current = view;
     setStore(store);
@@ -125,9 +125,7 @@ export function RadarScreen() {
     function publish() {
       // The nowcast at home from the newest frame, whatever the playhead. A nowcast not ready yet (a new
       // frame whose flow is still computing) keeps the last line.
-      const p = store.radar ? RADARS[store.radar].tapeProduct : null;
-      const geom = p ? store.geometry(p) : null;
-      const fc = p && geom ? buildHomeForecast(store, p, geom) : null;
+      const fc = buildHomeForecast(store, store.tapeProducts());
       setUi((u) => ({
         t: view.time(), live: view.isLive(), radar: store.radar, status: store.status, newestMs: store.newestMs,
         hint: fc ? rainHint(fc.values, SERIES_STEP_MS) : (u?.hint ?? null),
@@ -153,7 +151,7 @@ export function RadarScreen() {
       if (view.layer) addRadarLayer(map, view.layer);
       view.onStoreChange();
     });
-    // Range choice (spec §7.5): only a zoom that changes the best range does anything.
+    // Nested ranges (nested-ranges spec §5): the view decides which ranges to load in full.
     map.on("moveend", () => {
       view.onMoveEnd();
       publish();

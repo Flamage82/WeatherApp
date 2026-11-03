@@ -174,20 +174,18 @@ Mockups were reviewed with the user in a browser companion. The chosen layout is
 - The motion fields are **kept around**, because nowcasting (§9) extrapolates them past the newest frame.
 - Candidate approaches the builder may evaluate: pyramidal Lucas–Kanade, a TV-L1 or Farnebäck-style dense flow, or block matching/phase correlation on a coarse grid followed by smoothing. Radar fields are small (512²) and the window holds about 24 pairs, so computing once per pair is affordable.
 
-### 7.5 Picking a range as you zoom **(call)**
-- The app shows the sharpest range of the active radar that covers the visible map: 64 km when zoomed in tight, 128 km otherwise (the 256/512 km ranges are dropped, §3). When the choice changes, it cross-fades between ranges. Zoomed out beyond the 128 km frame, the radar simply ends at the frame edge; limit the map's minimum zoom so the frame still fills most of a phone screen **(call, Task 20)**.
-- Frames and motion fields are handled per range. On start-up, load the **128 km** range (`IDR503`) first for the map, along with the tape's source (`IDR504`, §6.2). Load other ranges when zoom calls for them.
-- Because interpolation is per range, mixing ranges inside one animation isn't required.
+### 7.5 Nested ranges **(user, 2026-11-03)**
+Superseded by `2026-11-03-nested-ranges-design.md`. In short: all of the active radar's ranges are drawn at once, finest first, with a narrow blend at each finer range's edge; zooming no longer switches ranges, it only changes which ranges are loaded in full (§4–5 there). Start-up loads the tape product (`IDR504`) plus the 128 km range's (`IDR503`) newest frames.
 
 ### 7.6 Backup radar **(call)**
 - If Marburg's newest frame is over about 20 min old, or frames are missing, switch the whole loop to Mt Stapylton (IDR66x) and say so on screen. Never mix the two radars within one loop. A manual switch between radars is nice to have, if cheap.
 
 ### 7.7 Nowcast **(user, 2026-10-28; built in Task 18)**
 - The playhead may go up to **60 min past the newest frame**. There, the map shows the newest frame advected along a **forecast motion field**: plain semi-Lagrangian backward advection with constant velocity, `level(p, lead) = newest(p − lead · V(p))`.
-- `V` is the mean of the last ≤ 3 pair flows in px/ms, filled across the **whole** frame by 1/d² weighting (the interpolation flow only reaches ~48 px past rain, which would stall advected rain).
+- `V` is the mean of the last ≤ 3 pair flows in px/ms, filled across the **whole** frame by 1/d² weighting (the interpolation flow only reaches ~48 px past rain, which would stall advected rain). Inside the 128 km frame, **every** range's nowcast uses the 128 km range's `V` (`IDR503`), so the map's ranges and the tape agree; until that flow is ready a range uses its own. The 256 and 512 km ranges use their own `V` (nested-ranges design §4.4).
 - The forecast fades with lead time (opacity 1 → 0.55 at +60 min). The clock shows "+25 min forecast".
-- **Rain hint** under the clock, from the forecast at home: "Rain in ~25 min · heavy", "Raining now · moderate · until ~20 min", or nothing. Minutes round to 5; a level of at least 0.5 counts as rain.
-- **Known limits:** no growth or decay (good for organised bands, poor for pop-up storms), and rain can't enter from outside the frame, so the upwind edge of the 64 km range empties by +40–60 min. The hint uses the tape product (`IDR504`), so a fast storm still more than ~60 km away can be missed late in the hour. Using `IDR503` for the hint would fix that (open idea).
+- **Rain hint** under the clock, from the nested nowcast at home (the tape product's image moved with the 128 km motion, and the 128 km image where the source point leaves the tape product's frame; the same sampler as the map, so the hint, the tape and the map agree): "Rain in ~25 min · heavy", "Raining now · moderate · until ~20 min", or nothing. Minutes round to 5; a level of at least 0.5 counts as rain.
+- **Known limits:** no growth or decay (good for organised bands, poor for pop-up storms). Inside the 128 km square, rain now enters from outside the 64 km frame (the coarser range supplies it), so the old "upwind edge empties" and "a fast storm more than ~60 km away is missed" limits no longer apply there. Beyond the 128 km square the 256 and 512 km ranges move with their own motion, so a storm can look slightly doubled or smeared in a blend band late in the hour (accepted).
 
 ## 8. Risks and the first spike
 

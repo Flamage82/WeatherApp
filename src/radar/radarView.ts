@@ -1,31 +1,34 @@
 import type { Map as MlMap } from "maplibre-gl";
 import { RADARS, type ProductId } from "../../shared/config";
-import { FrameStore } from "../data/frameStore";
-import { pickRange } from "../geo/pickRange";
-import { RadarLayer } from "../render/radarLayer";
-
-/** Range-change crossfade length (spec §7.5). */
-export const CROSSFADE_MS = 300;
-
-type Slot = { product: ProductId; layer: RadarLayer; drawn: boolean };
+import { FrameStore, type FramePair } from "../data/frameStore";
+import { neededRanges } from "../geo/neededRanges";
+import { isFresh } from "../motion/nest";
+import { MAX_SLOTS, RadarLayer, type LayerSlot } from "../render/radarLayer";
 
 /**
- * Keeps the map's radar layer in step with the store and the view:
+ * Whether a slot's pair counts as data at `t`. A pair the store just returned for `t` is current by
+ * definition (a nowcast pair is stamped with the newest frame twice, so `isFresh` alone would call it stale
+ * past +5 min); only a kept pair, held over from an earlier draw, is held to the tolerance.
+ */
+export function pairFresh(returned: boolean, kept: { fromMs: number; toMs: number }, t: number): boolean {
+  return returned || isFresh(kept, t);
+}
+
+/**
+ * Keeps the map's one radar layer in step with the store and the view (spec §4, §5):
  *
- * - Draws `store.getPair(product, t)` on the current layer; when a pair isn't decoded yet the layer
- *   keeps its last pair, so the map never goes blank.
- * - Range choice: `pickRange` over the active radar's geometries, re-run on `moveend` and on store
- *   changes (a radar switch changes the geometries). A different product becomes the *next* slot:
- *   `ensureProduct`, wait until it has a pair, then crossfade over CROSSFADE_MS with
- *   `RadarLayer.setCrossfade` and finish by the hand-off contract (remove current, add next).
- *   While a fade runs, picks are deferred to its end. Panning within the same range does nothing.
- * - `t === null` means live: the newest loaded frame. A `t` past it draws the store's nowcast.
+ * - Draws every range of the active radar at once, finest first, as the layer's slots. A range's slot
+ *   is its pair at the drawn time; when that isn't decoded yet the range's last pair is kept, and the
+ *   layer counts it as data only while `isFresh` (within one frame interval of the time), or as the
+ *   fallback where nothing fresh covers a spot, so scrubbing into undecoded frames never blanks the map.
+ * - Needed ranges: on `moveend` and on store changes, `neededRanges` for the view tells the store which
+ *   ranges to load in full. Zooming only changes that set; nothing switches or fades.
+ * - `t === null` means live: the tape product's newest frame. A `t` past it draws the store's nowcast.
  */
 export class RadarView {
-  private cur: Slot | null = null;
-  private next: Slot | null = null;
-  private fadeStart: number | null = null;
-  private raf = 0;
+  private radarLayer: RadarLayer | null = null;
+  private kept = new Map<ProductId, FramePair>();
+  private neededKey = "";
   private t: number | null = null;
 
   constructor(
@@ -33,17 +36,11 @@ export class RadarView {
     private readonly store: FrameStore,
     /** Adds a layer at the right place in the style (under the labels). */
     private readonly addLayer: (l: RadarLayer) => void,
-    /** Called when the displayed product changes (a fade finished). */
-    private readonly onProduct: () => void = () => {},
   ) {}
 
   /** The layer that belongs on the map (re-added after a style change). */
   get layer(): RadarLayer | null {
-    return this.cur?.layer ?? null;
-  }
-
-  get product(): ProductId | null {
-    return this.cur?.product ?? null;
+    return this.radarLayer;
   }
 
   /** The time being drawn. */
@@ -61,105 +58,66 @@ export class RadarView {
   }
 
   onStoreChange(): void {
-    this.repick();
+    this.updateNeeded();
     this.draw();
   }
 
   onMoveEnd(): void {
-    this.repick();
+    this.updateNeeded();
     this.draw();
   }
 
   dispose(): void {
-    cancelAnimationFrame(this.raf);
-    this.next?.layer.releaseTextures();
-    this.cur?.layer.releaseTextures();
-    this.cur = this.next = null;
+    this.radarLayer?.releaseTextures();
+    this.radarLayer = null;
+    this.kept.clear();
   }
 
-  private wanted(): ProductId | null {
+  /**
+   * Tell the store which ranges the view needs. Metas arrive one by one, and a partial list would
+   * pull in ranges we don't need, so wait for all of them; the store already loads the tape product and
+   * its support meanwhile.
+   */
+  private updateNeeded(): void {
     const radar = this.store.radar;
-    if (!radar) return null;
+    if (!radar) return;
     const geoms = this.store.geometries();
-    // Metas arrive one by one; picking over a partial list would pull in ranges we don't need.
-    if (geoms.length < RADARS[radar].products.length) {
-      const cur = this.cur?.product;
-      return cur && RADARS[radar].products.includes(cur) ? cur : FrameStore.startProduct(radar);
-    }
+    if (geoms.length < RADARS[radar].products.length) return;
     const b = this.map.getBounds();
-    return pickRange({ west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() }, geoms);
-  }
-
-  private repick(): void {
-    if (this.fadeStart !== null) return; // re-run when the fade ends
-    const want = this.wanted();
-    if (!want) return;
-    this.store.ensureProduct(want); // idempotent; retried here if the store wasn't ready before
-    if (!this.cur) {
-      // First product: draw on a layer straight away, no fade.
-      this.cur = { product: want, layer: new RadarLayer(), drawn: false };
-      this.addLayer(this.cur.layer);
-      return;
-    }
-    if (want === this.cur.product) {
-      if (this.next) this.discardNext(); // zoomed back before the new range was ready
-      return;
-    }
-    if (this.next?.product === want) return;
-    if (this.next) this.discardNext();
-    this.next = { product: want, layer: new RadarLayer(), drawn: false };
-  }
-
-  private discardNext(): void {
-    this.next?.layer.releaseTextures();
-    this.next = null;
-  }
-
-  private drawSlot(s: Slot, t: number): void {
-    const g = this.store.geometry(s.product);
-    if (g && s.layer.geometry !== g) s.layer.setGeometry(g);
-    const pair = this.store.getPair(s.product, t);
-    if (pair && s.layer.geometry) {
-      s.layer.setPair(pair.a, pair.b, pair.flow, pair.alpha, pair.forecastLeadMs ?? 0);
-      s.drawn = true;
-    }
+    const needed = neededRanges(
+      { west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() },
+      geoms.reverse(), // finest first
+    );
+    const key = `${radar}:${needed.join()}`;
+    if (key === this.neededKey) return;
+    this.neededKey = key;
+    this.store.setNeeded(needed);
   }
 
   private draw(): void {
+    const radar = this.store.radar;
+    if (!radar) return;
     const t = this.time();
-    if (this.cur) this.drawSlot(this.cur, t);
-    if (this.next) this.drawSlot(this.next, t);
-    if (this.cur && this.next?.drawn && this.fadeStart === null) {
-      // Nothing on screen yet (or a radar switch with no old picture): swap without a fade.
-      if (!this.cur.drawn) this.finishFade();
-      else this.startFade();
+    const products = [...RADARS[radar].products].reverse(); // finest first
+    for (const p of this.kept.keys()) if (!products.includes(p)) this.kept.delete(p); // radar switch
+    const slots: LayerSlot[] = [];
+    for (const p of products) {
+      const geometry = this.store.geometry(p);
+      if (!geometry) continue;
+      const pair = this.store.getPair(p, t);
+      if (pair) this.kept.set(p, pair);
+      const k = this.kept.get(p);
+      if (!k) continue;
+      slots.push({
+        product: p, geometry, a: k.a, b: k.b, flow: k.flow, alpha: k.alpha, leadMs: k.forecastLeadMs ?? 0,
+        motion: k.motion, fresh: pairFresh(pair !== null, k, t),
+      });
     }
-  }
-
-  private startFade(): void {
-    this.fadeStart = performance.now();
-    const tick = () => {
-      if (!this.cur || !this.next || this.fadeStart === null) return;
-      const mix = Math.min(1, (performance.now() - this.fadeStart) / CROSSFADE_MS);
-      this.cur.layer.setCrossfade(this.next.layer, mix);
-      if (mix >= 1) this.finishFade();
-      else this.raf = requestAnimationFrame(tick);
-    };
-    tick();
-  }
-
-  /** Hand-off per RadarLayer's contract: remove the current layer, then add the target. */
-  private finishFade(): void {
-    const old = this.cur!, nxt = this.next!;
-    this.fadeStart = null;
-    if (this.map.getLayer(old.layer.id)) this.map.removeLayer(old.layer.id);
-    else old.layer.releaseTextures();
-    this.cur = nxt;
-    this.next = null;
-    this.addLayer(nxt.layer);
-    this.onProduct();
-    // Picks were deferred during the fade; the view or radar may have changed meanwhile.
-    this.repick();
-    this.draw();
+    if (slots.length === 0) return;
+    if (!this.radarLayer) {
+      this.radarLayer = new RadarLayer();
+      this.addLayer(this.radarLayer);
+    }
+    this.radarLayer.setSlots(slots.slice(0, MAX_SLOTS));
   }
 }

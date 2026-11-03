@@ -1,9 +1,11 @@
-import { NOWCAST_MAX_MS, type ProductId } from "../../shared/config";
+import { BLEND_PX, NOWCAST_MAX_MS, type ProductId } from "../../shared/config";
+import { pixelAffine, type PixelAffine } from "../../shared/gnomonic";
 import { homePixel } from "../../shared/homeSample";
 import type { RadarGeometry } from "../../shared/types";
 import type { FrameStore } from "../data/frameStore";
 import type { FlowField } from "../motion/flow";
-import { sampleForecastMaxInDisc, sampleInterpolatedMaxInDisc } from "../motion/interpolate";
+import { maxInDisc, sampleInterpolatedMaxInDisc } from "../motion/interpolate";
+import { KEPT_TOLERANCE_MS, sampleNested, type NestSlot } from "../motion/nest";
 import { SERIES_STEP_MS } from "./tapeMath";
 
 /**
@@ -31,29 +33,56 @@ export function buildHomeSeries(
 /** The nowcast at home: `values[k]` at `fromMs` (the newest frame) + k * 30 s, to NOWCAST_MAX_MS. */
 export type HomeForecast = { fromMs: number; values: Float32Array };
 
-/** One build per forecast flow (the store makes one per newest frame and pair count). */
-const forecastMemo = new WeakMap<FlowField, { geom: RadarGeometry; h: HomeForecast }>();
+/**
+ * One build per tape nowcast flow, which changes when the shared motion arrives, plus the newest frame of
+ * every range read: `key`.
+ */
+const forecastMemo = new WeakMap<FlowField, { key: string; h: HomeForecast }>();
 
 /**
- * The nowcast at home from the product's newest frame, sampled as `buildHomeSeries` samples the past
- * (max over the home disc's native cells). Null until the store has a nowcast for the product.
+ * The nested nowcast at home, as the map draws it (spec §6): `products` is finest first, `products[0]` the
+ * tape product. Each step is the max, over the tape product's home-disc cell centres (as
+ * `buildHomeSeries` samples the past), of `sampleNested` over the ranges' pairs at that time, each read
+ * at the same spot in its own pixels. Null until the tape product has a nowcast.
  */
 export function buildHomeForecast(
-  store: Pick<FrameStore, "frames" | "getPair">, product: ProductId, geom: RadarGeometry,
+  store: Pick<FrameStore, "frames" | "getPair" | "geometry">, products: ProductId[],
 ): HomeForecast | null {
-  const fr = store.frames(product);
+  const tape = products[0];
+  const geom = tape ? store.geometry(tape) : null;
+  if (!tape || !geom) return null;
+  const fr = store.frames(tape);
   if (fr.length < 2) return null;
   const fromMs = fr[fr.length - 1]!;
-  const pair = store.getPair(product, fromMs + SERIES_STEP_MS);
-  if (!pair?.forecastLeadMs) return null;
-  const memo = forecastMemo.get(pair.flow);
-  if (memo && memo.geom === geom && memo.h.fromMs === fromMs) return memo.h;
+  const first = store.getPair(tape, fromMs + SERIES_STEP_MS);
+  if (!first?.forecastLeadMs) return null;
+  const key = [geom.product, fromMs, ...products.map((p) => store.frames(p).at(-1))].join();
+  const memo = forecastMemo.get(first.flow);
+  if (memo?.key === key) return memo.h;
+
   const { x, y, rPx } = homePixel(geom);
+  // A range stalled more than a frame interval behind the tape product would paint hours-old rain in.
+  const ranges = products.flatMap((p) => {
+    const g = store.geometry(p);
+    const newest = store.frames(p).at(-1);
+    return g && newest !== undefined && newest >= fromMs - KEPT_TOLERANCE_MS ? [{ p, affine: pixelAffine(geom, g) }] : [];
+  });
   const values = new Float32Array(NOWCAST_MAX_MS / SERIES_STEP_MS + 1);
   for (let k = 0; k < values.length; k++) {
-    values[k] = sampleForecastMaxInDisc(pair.a, pair.flow, k * SERIES_STEP_MS, x, y, rPx, pair.cell);
+    const slots: NestSlot[] = [], affines: PixelAffine[] = [];
+    for (const { p, affine } of ranges) {
+      const pair = store.getPair(p, fromMs + k * SERIES_STEP_MS);
+      if (!pair) continue; // no data from this range at this time
+      slots.push({
+        a: pair.a, b: pair.b, flow: pair.flow, alpha: pair.alpha, leadMs: pair.forecastLeadMs ?? 0,
+        cell: pair.cell, band: BLEND_PX[p], motion: pair.motion, fresh: true,
+      });
+      affines.push(affine);
+    }
+    values[k] = maxInDisc(x, y, rPx, first.cell, (px, py) =>
+      sampleNested(slots, affines.map((m) => ({ x: m.sx * px + m.ox, y: m.sy * py + m.oy })))?.level ?? 0);
   }
   const h = { fromMs, values };
-  forecastMemo.set(pair.flow, { geom, h });
+  forecastMemo.set(first.flow, { key, h });
   return h;
 }

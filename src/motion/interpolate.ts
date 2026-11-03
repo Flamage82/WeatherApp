@@ -9,7 +9,7 @@ import { flowAt, type FlowField } from "./flow";
  * plateau-plus-ramp staircase. Cells outside the frame read 0.
  * With k = 1 this is plain per-pixel bilinear: pixel (ix, iy) has its value at (x = ix, y = iy).
  */
-function bilinear(f: LevelField, x: number, y: number, k: CellSize): number {
+export function bilinear(f: LevelField, x: number, y: number, k: CellSize): number {
   const n = 512 / k;
   // Cell coords q = (p + 0.5)/k - 0.5, written as (p - (k-1)/2)/k so k = 1 gives q = p exactly.
   const h = (k - 1) / 2;
@@ -63,7 +63,7 @@ export function forecastOpacity(leadMs: number): number {
 }
 
 /** Max of `sample(x, y)` over the native cell centres (pixel k*c + (k-1)/2) within rPx of (cx, cy), inside the frame. */
-function maxInDisc(cx: number, cy: number, rPx: number, cell: CellSize, sample: (x: number, y: number) => number): number {
+export function maxInDisc(cx: number, cy: number, rPx: number, cell: CellSize, sample: (x: number, y: number) => number): number {
   let m = 0;
   const r2 = rPx * rPx;
   const h = (cell - 1) / 2, last = 512 / cell - 1;

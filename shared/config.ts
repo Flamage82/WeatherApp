@@ -63,6 +63,22 @@ export const RADARS: {
   stapylton: { products: ["IDR661", "IDR662", "IDR663", "IDR664"], tapeProduct: "IDR663" },
 };
 
+/**
+ * Width of the blend band inside each range's frame edge, in that range's own pixels (nested ranges,
+ * spec §4.2). About 5 km at 64 km, ~6 km at 128 km and ~12 km at 256 km; the widest range has no
+ * edge to blend into. Builder-tunable by eye.
+ */
+export const BLEND_PX: Record<ProductId, number> = {
+  IDR504: 20, IDR503: 12, IDR502: 12, IDR501: 0,
+  IDR664: 20, IDR663: 12, IDR662: 12, IDR661: 0,
+};
+
+/** Which range's forecast flow moves each range's nowcast (spec §4.4): the 128 km range inside its frame. */
+export const NOWCAST_MOTION: Record<ProductId, ProductId> = {
+  IDR504: "IDR503", IDR503: "IDR503", IDR502: "IDR502", IDR501: "IDR501",
+  IDR664: "IDR663", IDR663: "IDR663", IDR662: "IDR662", IDR661: "IDR661",
+};
+
 export const MANIFEST_SPAN_MS = 86_400_000;
 export const DEFAULT_WINDOW_MS = 7_200_000;
 export const MAX_FLOW_GAP_MS = 900_000;

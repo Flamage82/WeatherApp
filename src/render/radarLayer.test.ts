@@ -2,10 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { CustomRenderMethodInput, Map as MlMap } from "maplibre-gl";
 import { parseMapFile } from "../../worker/mapFile";
 import m503 from "../../worker/__fixtures__/IDR503.map?raw";
+import m501 from "../../shared/__fixtures__/IDR501.map?raw";
+import m502 from "../../shared/__fixtures__/IDR502.map?raw";
 import m504 from "../../shared/__fixtures__/IDR504.map?raw";
+import m663 from "../../shared/__fixtures__/IDR663.map?raw";
+import m664 from "../../shared/__fixtures__/IDR664.map?raw";
 import type { LevelField } from "../../shared/decodeFrame";
+import { IDENTITY_AFFINE } from "../../shared/gnomonic";
 import { ZERO_FLOW } from "../motion/flow";
-import { RadarLayer } from "./radarLayer";
+import { MAX_SLOTS, RadarLayer, type LayerSlot } from "./radarLayer";
 
 /**
  * Minimal WebGL2 stand-in: every method is a no-op returning a fresh object, except that textures
@@ -45,74 +50,67 @@ const fakeMap = () => ({ triggerRepaint: () => {} }) as unknown as MlMap;
 const opts = { defaultProjectionData: { mainMatrix: new Float32Array(16) } } as unknown as CustomRenderMethodInput;
 const field = (): LevelField => ({ width: 512, height: 512, data: new Uint8Array(512 * 512) });
 
-function loaded(id: string, map: string) {
-  const l = new RadarLayer(id);
-  l.setGeometry(parseMapFile(map));
-  l.setPair(field(), field(), ZERO_FLOW, 0.5);
-  return l;
+function slot(map: string, fresh = true): LayerSlot {
+  const geometry = parseMapFile(map);
+  return {
+    product: geometry.product, geometry, a: field(), b: field(), flow: ZERO_FLOW,
+    alpha: 0.5, leadMs: 0, motion: IDENTITY_AFFINE, fresh,
+  };
 }
 
-describe("RadarLayer crossfade hand-off", () => {
-  it("frees every texture after A -> B hand-off and B's later removal", () => {
+describe("RadarLayer slots", () => {
+  it("passes each slot's state and band, finest first, with absent slots off", () => {
+    const { gl, calls, uniforms } = mockGl();
+    const l = new RadarLayer();
+    l.onAdd(fakeMap(), gl);
+    l.setSlots([slot(m504, true), slot(m503, false)]);
+    calls.length = 0;
+    l.render(gl, opts);
+    const u = uniforms();
+    expect(u.u_on0).toEqual([1]);
+    expect(u.u_on1).toEqual([2]);
+    expect(u.u_on2).toEqual([0]);
+    expect(u.u_on3).toEqual([0]);
+    expect(u.u_band0).toEqual([20]);
+    expect(u.u_band1).toEqual([12]);
+  });
+
+  it("releases the old products' textures when the slots are replaced (radar switch)", () => {
     const { gl, live } = mockGl();
-    const map = fakeMap();
-    const a = loaded("a", m503), b = loaded("b", m504);
-    a.onAdd(map, gl);
-    a.setCrossfade(b, 0.5);
-    a.render(gl, opts);
-    expect(live.size).toBe(1 + 3 + 3); // A's LUT + A's frame textures + B's (borrowed context)
+    const l = new RadarLayer();
+    l.onAdd(fakeMap(), gl);
+    const lut = new Set(live);
+    l.setSlots([slot(m504), slot(m503)]);
+    l.render(gl, opts);
+    const marburg = [...live].filter((t) => !lut.has(t));
+    expect(marburg).toHaveLength(6);
 
-    // Hand-off: remove A, add B.
-    a.onRemove(map, gl);
-    expect(live.size).toBe(3); // B's frame textures survive for reuse
-    b.onAdd(map, gl);
-    b.render(gl, opts);
-    expect(live.size).toBe(1 + 3); // B's LUT + the same 3 frame textures (no re-create)
-
-    b.onRemove(map, gl);
-    expect(live.size).toBe(0); // regression: B's stale `owner` used to keep these alive
+    l.setSlots([slot(m664), slot(m663)]);
+    l.render(gl, opts);
+    expect(marburg.filter((t) => live.has(t))).toHaveLength(0); // every Marburg texture deleted
+    expect(live.size - lut.size).toBe(6); // only Stapylton's 6 frame textures are live
   });
 
-  it("adding the target first detaches it from its old owner", () => {
-    const { gl, live, calls, uniforms } = mockGl();
+  it("re-creates every slot's textures in a new context after remove and re-add (style switch)", () => {
+    const first = mockGl();
     const map = fakeMap();
-    const a = loaded("a", m503), b = loaded("b", m504);
-    a.onAdd(map, gl);
-    a.setCrossfade(b, 0.5);
-    calls.length = 0;
-    a.render(gl, opts);
-    expect(uniforms().u_mix).toEqual([0.5]);
-    expect(uniforms().u_extent1).not.toEqual(uniforms().u_extent0); // slot 1 = B
+    const l = new RadarLayer();
+    l.onAdd(map, first.gl);
+    l.setSlots([slot(m504), slot(m503)]);
+    l.render(first.gl, opts);
+    l.onRemove(map, first.gl);
+    expect(first.live.size).toBe(0);
 
-    b.onAdd(map, gl); // other order: add B, then remove A
-
-    // A no longer draws B: mix 0, and slot 1 just repeats A's own data.
-    calls.length = 0;
-    a.render(gl, opts);
-    expect(uniforms().u_mix).toEqual([0]);
-    expect(uniforms().u_extent1).toEqual(uniforms().u_extent0);
-
-    a.onRemove(map, gl);
-    b.onRemove(map, gl);
-    expect(live.size).toBe(0);
+    const second = mockGl();
+    l.onAdd(map, second.gl);
+    const lut = second.live.size;
+    l.render(second.gl, opts);
+    expect(second.live.size - lut).toBe(3 * 2);
   });
 
-  it("refuses a crossfade target that is on the map", () => {
-    const { gl } = mockGl();
-    const map = fakeMap();
-    const a = loaded("a", m503), b = loaded("b", m504);
-    a.onAdd(map, gl);
-    b.onAdd(map, gl);
-    expect(() => a.setCrossfade(b, 0.5)).toThrow();
-  });
-
-  it("passes the product's native cell size to the shader", () => {
-    const { gl, uniforms } = mockGl();
-    const a = loaded("a", m503);
-    a.onAdd(fakeMap(), gl);
-    a.render(gl, opts);
-    // Slot 1 reuses slot 0's data when not crossfading; both are CELL_SIZE.IDR503 = 2.
-    expect(uniforms().u_cell0).toEqual([2]);
-    expect(uniforms().u_cell1).toEqual([2]);
+  it("refuses more than MAX_SLOTS slots", () => {
+    const l = new RadarLayer();
+    expect(MAX_SLOTS).toBe(4);
+    expect(() => l.setSlots([m504, m503, m502, m501, m664].map((m) => slot(m)))).toThrow();
   });
 });

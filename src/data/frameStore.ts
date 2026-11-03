@@ -1,15 +1,27 @@
 import {
-  CELL_SIZE, DEFAULT_WINDOW_MS, MANIFEST_SPAN_MS, NOWCAST_MAX_MS, RADARS, type CellSize, type ProductId,
+  CELL_SIZE, DEFAULT_WINDOW_MS, MANIFEST_SPAN_MS, MAX_FLOW_GAP_MS, NOWCAST_MAX_MS, NOWCAST_MOTION, RADARS,
+  type CellSize, type ProductId,
 } from "../../shared/config";
 import type { LevelField } from "../../shared/decodeFrame";
+import { IDENTITY_AFFINE, pixelAffine, type PixelAffine } from "../../shared/gnomonic";
 import { msToStamp, stampToMs } from "../../shared/stamps";
 import type { Manifest, RadarGeometry } from "../../shared/types";
 import { FORECAST_PAIRS, forecastFlow, type FlowField } from "../motion/flow";
 import { locate } from "../time/timeline";
 import { chooseRadar, type RadarName } from "./chooseRadar";
 
-/** Decoded frames + flows kept per product: a window this long around the playhead (spec §6.4). */
+/** Decoded frames + flows kept for the tape product: a window this long around the playhead (spec §6.4). */
 export const DECODED_CAP_MS = 21_600_000;
+/**
+ * The decode window of a needed range other than the tape product: this long, centred on the focus
+ * and cut to the known stamps (nested-ranges spec §5).
+ */
+export const OUTER_DECODED_CAP_MS = 7_200_000;
+/**
+ * Decoded frames held in total (~46 MB) before ranges that are no longer needed lose theirs, furthest
+ * from the focus first (nested-ranges spec §5).
+ */
+export const DECODED_BUDGET_FRAMES = 180;
 /** Manifest poll interval while the page is visible. */
 export const REFRESH_MS = 60_000;
 /** Frame fetch+decode jobs in flight at once. */
@@ -34,9 +46,14 @@ export type FrameStoreDeps = {
  * value from the geometry itself.
  * Past the newest frame it is the nowcast: `forecastLeadMs` > 0, a = b = the newest frame, `flow` is
  * the forecast flow (px per ms, `forecastFlow`) and alpha is 0.
+ * `fromMs`/`toMs` are the stamps of a and b (both the newest frame's in the nowcast), so a drawn pair
+ * can tell how stale it is (`isFresh`). `flow` of a nowcast is in the grid of `motionFrom`: usually the
+ * range's own (identity `motion`), or the nowcast-motion range's (spec §4.4), with `motion` mapping this
+ * range's pixels onto that grid's.
  */
 export type FramePair = {
   a: LevelField; b: LevelField; flow: FlowField; alpha: number; cell: CellSize; forecastLeadMs?: number;
+  fromMs: number; toMs: number; motion: PixelAffine; motionFrom: ProductId;
 };
 
 type ProductState = {
@@ -66,8 +83,14 @@ type ProductState = {
    * The nowcast base: the newest frame, its field and the forecast flow from `pairs` pair flows. Kept
    * (holding its field) even if the decode window moves away, so the nowcast stays available.
    */
-  forecast: { newest: number; a: LevelField; pairs: number; flow: FlowField } | null;
+  forecast: { newest: number; a: LevelField; pairs: number; flow: FlowField; measured: boolean } | null;
 };
+
+type Span = { start: number; end: number };
+/** Scheduling priority: tier, then two keys, smallest first (see `ranker`). */
+type Rank = [number, number, number];
+const byRank = (x: Rank, y: Rank) => x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+const within = (spans: Span[], ms: number) => spans.some((s) => ms >= s.start && ms <= s.end);
 
 const dayOf = (ms: number) => msToStamp(ms).slice(0, 8);
 const dayStartMs = (day: string) => stampToMs(`${day}0000`);
@@ -97,13 +120,19 @@ function indexOf(arr: number[], x: number): number {
  *   (`fetchEarliest`). Empty days inside the archive (outages) are crossed, not taken as its end.
  *   `frames(p)` exposes the known stamps from the requested start (`extendBack`; initially
  *   newest − 2 h) to the newest.
- * - **Decoding** is limited to a window of `DECODED_CAP_MS` centred on the focus: the last
- *   `ensureAround(t)`, or the newest frame after `ensureAround(null)` (live, the default). The window
- *   is shifted to stay inside the requested range. Frames and flows outside it are evicted; frames load
- *   nearest-to-focus first. So `extendBack` far into the past learns the stamps but only decodes what
- *   falls in that window; `ensureAround` loads the rest.
+ * - **Decoding** is limited to a window per product around the focus: the last `ensureAround(t)`, or
+ *   the newest frame after `ensureAround(null)` (live, the default). The tape product's is
+ *   `DECODED_CAP_MS`, shifted to stay inside the requested range; the other ranges the view needs
+ *   (`setNeeded`) get `OUTER_DECODED_CAP_MS` centred on the focus; the nowcast support ranges always
+ *   keep their newest `FORECAST_PAIRS + 1` frames. Frames and flows outside an active product's window
+ *   are evicted. A range no longer needed keeps what it decoded until the total passes
+ *   `DECODED_BUDGET_FRAMES`. So `extendBack` far into the past learns the stamps but only decodes what
+ *   falls in the windows; `ensureAround` loads the rest.
+ * - **Priority** (frames and flows alike): the tape product's pair at the focus, then the support
+ *   ranges' newest frames and pairs, then the other needed ranges' pairs at the focus (finest first),
+ *   then everything else nearest the focus, finer ranges on ties (nested-ranges spec §5).
  * - **Flows:** the store owns the queue. A pair is wanted while both frames are decoded, adjacent and
- *   flowless; one flow is computed at a time, always the wanted pair nearest the focus, chosen when it
+ *   flowless; one flow is computed at a time, always the wanted pair of highest priority, chosen when it
  *   is sent, so nothing stale is ever sent and no evicted frame is held by a queue. A returned flow is
  *   kept if both stamps are still decoded and adjacent (stamps are immutable, so it is still valid).
  * - Dispatches `"change"` (coalesced per microtask) whenever anything observable changes.
@@ -119,6 +148,12 @@ export class FrameStore extends EventTarget {
   private metas = new Map<ProductId, RadarGeometry>();
   private metaLoading = new Set<ProductId>();
   private lastTape: { marburg: Manifest | null; stapylton: Manifest | null } = { marburg: null, stapylton: null };
+  private affines = new Map<string, PixelAffine>();
+  /**
+   * Ranges the view needs (`setNeeded`), beyond the tape product and its nowcast support. Kept as given
+   * (it may be set before a radar is chosen); products of another radar are ignored where it is read.
+   */
+  private needed = new Set<ProductId>();
   private wantStart: number | null = null;
   private focus: number | null = null;
   private queue: { ps: ProductState; ms: number }[] = [];
@@ -188,12 +223,75 @@ export class FrameStore extends EventTarget {
     return this.refreshing;
   }
 
-  /** Starts loading another range of the active radar (no-op for the other radar's products). */
-  ensureProduct(p: ProductId): void {
-    if (!this.radar || !RADARS[this.radar].products.includes(p) || this.products.has(p)) return;
-    if (this.status === "empty") return;
-    const ps = this.newProduct(p);
-    this.track(this.syncProduct(ps, this.gen));
+  /**
+   * The ranges the view needs beyond the tape product (any order; the other radar's products are
+   * ignored). A new one is created and synced; one already held (a support range, or one needed before)
+   * learns its stamps back to the requested start. A range dropped from the list stops loading and
+   * keeps its decoded frames until the budget needs them. May be called before a radar is chosen: the
+   * list is applied at the first refresh.
+   */
+  setNeeded(ps: ProductId[]): void {
+    const before = this.needed;
+    this.needed = new Set(ps);
+    if (!this.radar || this.wantStart === null) return; // the next refresh creates them
+    const g = this.gen;
+    for (const p of this.needed) {
+      if (!RADARS[this.radar].products.includes(p)) continue;
+      const have = this.products.get(p);
+      if (!have) this.track(this.syncProduct(this.newProduct(p), g));
+      else if (!before.has(p)) this.track(this.learnAndSchedule(have, g));
+    }
+    this.schedule();
+  }
+
+  /**
+   * The ranges the tape and the rain hint read, finest first: the tape product, then its nowcast
+   * support: the range whose motion moves it (`NOWCAST_MOTION`) and the next coarser range, which
+   * supplies the rain from outside the tape range's frame (spec §5, §6). Empty before a radar is chosen.
+   */
+  tapeProducts(): ProductId[] {
+    return this.radar ? FrameStore.tapeSet(this.radar) : [];
+  }
+
+  private static tapeSet(radar: RadarName): ProductId[] {
+    const { products, tapeProduct } = RADARS[radar];
+    const coarser = products[products.indexOf(tapeProduct) - 1];
+    return [...new Set([tapeProduct, NOWCAST_MOTION[tapeProduct], ...(coarser ? [coarser] : [])])];
+  }
+
+  private isTape(p: ProductId): boolean {
+    return p === RADARS[this.radar!].tapeProduct;
+  }
+
+  /** A nowcast support range (not the tape product): its newest frames are always kept. */
+  private isSupport(p: ProductId): boolean {
+    return !this.isTape(p) && FrameStore.tapeSet(this.radar!).includes(p);
+  }
+
+  /** The tape product or a needed range: its stamps are learnt back to the requested start. */
+  private learnsBack(p: ProductId): boolean {
+    return this.isTape(p) || this.needed.has(p);
+  }
+
+  /**
+   * The decode window of one product, as spans, given the tape product's window `w`. Empty: inactive
+   * (no loads, no flows; what it holds is evicted only by the budget).
+   */
+  private windowFor(ps: ProductState, w: { start: number; end: number; centre: number; lo: number; hi: number }): Span[] {
+    if (this.isTape(ps.p)) return [w];
+    const spans: Span[] = [];
+    if (this.needed.has(ps.p)) {
+      // Shifted to stay inside [lo, hi] like the tape window, so live it is the newest OUTER_DECODED_CAP_MS.
+      let start = w.centre - OUTER_DECODED_CAP_MS / 2, end = w.centre + OUTER_DECODED_CAP_MS / 2;
+      if (end > w.hi) { start -= end - w.hi; end = w.hi; }
+      if (start < w.lo) { end = Math.min(w.hi, end + (w.lo - start)); start = w.lo; }
+      spans.push({ start, end });
+    }
+    const fr = this.frames(ps.p);
+    if (this.isSupport(ps.p) && fr.length > 0) {
+      spans.push({ start: fr[Math.max(0, fr.length - 1 - FORECAST_PAIRS)]!, end: fr[fr.length - 1]! });
+    }
+    return spans;
   }
 
   /** Learns every loaded product's stamps back to `toMs` (manifest, then `fetchDay`), then loads them. */
@@ -206,6 +304,7 @@ export class FrameStore extends EventTarget {
     }
     const g = this.gen;
     for (const ps of this.products.values()) {
+      if (!this.learnsBack(ps.p)) continue; // support-only or inactive: it never needs older frames
       this.track(this.learn(ps, this.wantStart, g).then(() => this.schedule()));
     }
     this.schedule();
@@ -235,13 +334,41 @@ export class FrameStore extends EventTarget {
       const fc = this.forecastOf(ps, fr);
       if (!fc) return null;
       const forecastLeadMs = Math.min(t - newest, NOWCAST_MAX_MS);
-      return { a: fc.a, b: fc.a, flow: fc.flow, alpha: 0, cell: CELL_SIZE[p], forecastLeadMs };
+      const { flow, motion, motionFrom } = this.nowcastMotion(p, fc);
+      return {
+        a: fc.a, b: fc.a, flow, alpha: 0, cell: CELL_SIZE[p], forecastLeadMs,
+        fromMs: newest, toMs: newest, motion, motionFrom,
+      };
     }
     const { i, alpha } = locate(fr, t);
     const am = fr[i]!, bm = fr[i + 1]!;
     const a = ps.decoded.get(am), b = ps.decoded.get(bm), f = ps.flows.get(am);
     if (!a || !b || !f || f.b !== bm) return null;
-    return { a, b, flow: f.flow, alpha, cell: CELL_SIZE[p] };
+    return { a, b, flow: f.flow, alpha, cell: CELL_SIZE[p], fromMs: am, toMs: bm, motion: IDENTITY_AFFINE, motionFrom: p };
+  }
+
+  /**
+   * The motion that moves `p`'s nowcast: its `NOWCAST_MOTION` range's forecast flow when that is measured
+   * and both geometries are loaded (spec §4.4), else `p`'s own (start-up, or a frame gap left the
+   * source with zero flows), so the nowcast never freezes. While the source's newest frame is still being
+   * fetched or its flow computed, its last forecast keeps moving the nowcast, so the motion doesn't flip to
+   * `p`'s own and back each time the source publishes; but a source more than MAX_FLOW_GAP_MS behind `p`
+   * (one product stalled) is not used.
+   */
+  private nowcastMotion(p: ProductId, own: NonNullable<ProductState["forecast"]>) {
+    const src = NOWCAST_MOTION[p];
+    const sps = this.products.get(src);
+    const gp = this.metas.get(p), gs = this.metas.get(src);
+    if (src !== p && sps && gp && gs && this.frames(src).length >= 2) {
+      const fc = this.forecastOf(sps, this.frames(src)) ?? sps.forecast;
+      if (fc?.measured && own.newest - fc.newest <= MAX_FLOW_GAP_MS) {
+        const key = `${p}>${src}`;
+        let motion = this.affines.get(key);
+        if (!motion) this.affines.set(key, (motion = pixelAffine(gp, gs)));
+        return { flow: fc.flow, motion, motionFrom: src };
+      }
+    }
+    return { flow: own.flow, motion: IDENTITY_AFFINE, motionFrom: p };
   }
 
   /** Known stamps (ms, ascending) from the requested start to the newest. Don't mutate. */
@@ -257,10 +384,15 @@ export class FrameStore extends EventTarget {
     return ps.framesCache;
   }
 
-  /** Earliest known stamp to the newest, over the loaded products. */
+  /**
+   * Earliest known stamp to the newest, from the tape product when it has frames ("now" is the tape
+   * product's newest, spec §5.1), else over the loaded products.
+   */
   loadedWindow(): { start: number; end: number } {
     let start = Infinity, end = -Infinity;
-    for (const p of this.products.keys()) {
+    const tape = this.radar ? RADARS[this.radar].tapeProduct : null;
+    const ps = tape && this.frames(tape).length > 0 ? [tape] : [...this.products.keys()];
+    for (const p of ps) {
       const fr = this.frames(p);
       if (fr.length === 0) continue;
       start = Math.min(start, fr[0]!);
@@ -279,7 +411,7 @@ export class FrameStore extends EventTarget {
     return ps ? [...ps.decoded.keys()].sort((x, y) => x - y) : [];
   }
 
-  /** Geometries of the active radar's ranges that have loaded, widest to sharpest (for `pickRange`). */
+  /** Geometries of the active radar's ranges that have loaded, widest to sharpest (for `neededRanges`, which wants them reversed). */
   geometries(): RadarGeometry[] {
     if (!this.radar) return [];
     return RADARS[this.radar].products.flatMap((p) => this.metas.get(p) ?? []);
@@ -287,11 +419,6 @@ export class FrameStore extends EventTarget {
 
   geometry(p: ProductId): RadarGeometry | null {
     return this.metas.get(p) ?? null;
-  }
-
-  /** The map's first range for a radar: 128 km (IDR503 / IDR663). */
-  static startProduct(radar: RadarName): ProductId {
-    return RADARS[radar].products[2]!;
   }
 
   // ---- refresh / radar choice ------------------------------------------------------------------
@@ -322,8 +449,8 @@ export class FrameStore extends EventTarget {
     }
     const radar = choice.radar;
     this.ensureMetas(radar);
-    if (this.products.size === 0) {
-      for (const p of new Set([FrameStore.startProduct(radar), RADARS[radar].tapeProduct])) this.newProduct(p);
+    for (const p of [...FrameStore.tapeSet(radar), ...this.needed]) {
+      if (RADARS[radar].products.includes(p) && !this.products.has(p)) this.newProduct(p);
     }
     const tape = RADARS[radar].tapeProduct;
     const tapeManifest = radar === "marburg" ? mb : st;
@@ -396,7 +523,9 @@ export class FrameStore extends EventTarget {
   }
 
   private async learnAndSchedule(ps: ProductState, g: number): Promise<void> {
-    if (this.wantStart !== null && ps.coveredFrom !== Infinity) await this.learn(ps, this.wantStart, g);
+    if (this.wantStart !== null && ps.coveredFrom !== Infinity && this.learnsBack(ps.p)) {
+      await this.learn(ps, this.wantStart, g);
+    }
     if (g === this.gen) this.schedule();
   }
 
@@ -471,8 +600,12 @@ export class FrameStore extends EventTarget {
 
   // ---- decode window ---------------------------------------------------------------------------
 
-  /** The decode window: DECODED_CAP_MS around the focus, kept inside [requested start, newest]. */
-  private window(): { start: number; end: number; centre: number } | null {
+  /**
+   * The tape product's decode window: DECODED_CAP_MS around the focus, kept inside [requested start,
+   * newest] = [lo, hi]. `centre` is the focus clamped into [lo, hi]; every product's window and
+   * priority is taken around it.
+   */
+  private window(): { start: number; end: number; centre: number; lo: number; hi: number } | null {
     if (this.wantStart === null) return null;
     let hi = -Infinity;
     for (const ps of this.products.values()) if (ps.pool.length) hi = Math.max(hi, ps.pool[ps.pool.length - 1]!);
@@ -482,32 +615,89 @@ export class FrameStore extends EventTarget {
     }
     const lo = Math.min(this.wantStart, hi);
     const centre = Math.min(Math.max(this.focus ?? hi, lo), hi);
-    if (hi - lo <= DECODED_CAP_MS) return { start: lo, end: hi, centre };
+    if (hi - lo <= DECODED_CAP_MS) return { start: lo, end: hi, centre, lo, hi };
     let start = centre - DECODED_CAP_MS / 2;
     let end = centre + DECODED_CAP_MS / 2;
     if (end > hi) { start -= end - hi; end = hi; }
     if (start < lo) { end += lo - start; start = lo; }
-    return { start, end, centre };
+    return { start, end, centre, lo, hi };
   }
 
-  /** Evict outside the window, queue missing frames nearest-first, then send the next wanted flow. */
+  /**
+   * The priority of one product's frames and pairs around `centre` (nested-ranges spec §5), as
+   * [tier, key, key], smallest first:
+   * - 0: the tape product's focus pair (the stamps either side of the centre, clamped to its frames,
+   *   so its newest pair when the centre is past them);
+   * - 1: a support range's newest `FORECAST_PAIRS + 1` frames / newest pairs, finest first, newest first;
+   * - 2: another needed range's focus pair, finest first;
+   * - 3: everything else, nearest the centre first, finer range on ties.
+   */
+  private ranker(ps: ProductState, centre: number) {
+    const { products } = RADARS[this.radar!];
+    const fine = products.length - 1 - products.indexOf(ps.p); // 0 = finest
+    const fr = this.frames(ps.p);
+    const tape = this.isTape(ps.p), support = this.isSupport(ps.p), needed = this.needed.has(ps.p);
+    const k = fr.length > 0 ? locate(fr, centre).i : -1;
+    const fa = fr[k], fb = fr[k + 1];
+    const newestFrom = fr[Math.max(0, fr.length - 1 - FORECAST_PAIRS)] ?? Infinity;
+    const far = (ms: number) => Math.abs(ms - centre);
+    return {
+      frame: (ms: number): Rank => {
+        const focus = ms === fa || ms === fb;
+        if (tape && focus) return [0, far(ms), 0];
+        if (support && ms >= newestFrom) return [1, fine, -ms];
+        if (needed && focus) return [2, fine, far(ms)];
+        return [3, far(ms), fine];
+      },
+      pair: (am: number, bm: number): Rank => {
+        const focus = am === fa && bm === fb;
+        if (tape && focus) return [0, 0, 0];
+        if (support && am >= newestFrom) return [1, fine, -am];
+        if (needed && focus) return [2, fine, 0];
+        return [3, far((am + bm) / 2), fine];
+      },
+    };
+  }
+
+  /**
+   * Evict outside each active product's window (and inactive products' frames past the budget), queue
+   * missing frames by priority, then send the next wanted flow.
+   */
   private schedule(): void {
     const w = this.window();
     if (!w) return;
-    const inside = (ms: number) => ms >= w.start && ms <= w.end;
-    const jobs: { ps: ProductState; ms: number; d: number; order: number }[] = [];
-    let order = 0;
+    const jobs: { ps: ProductState; ms: number; rank: Rank }[] = [];
+    const idle: { ps: ProductState; ms: number }[] = [];
+    let total = 0;
     for (const ps of this.products.values()) {
-      for (const ms of ps.decoded.keys()) if (!inside(ms)) ps.decoded.delete(ms);
+      const spans = this.windowFor(ps, w);
+      if (spans.length === 0) {
+        for (const ms of ps.decoded.keys()) idle.push({ ps, ms });
+      } else {
+        for (const ms of ps.decoded.keys()) if (!within(spans, ms)) ps.decoded.delete(ms);
+        const rank = this.ranker(ps, w.centre);
+        for (const ms of this.frames(ps.p)) {
+          if (!within(spans, ms) || ps.decoded.has(ms) || ps.loading.has(ms) || ps.failed.has(ms)) continue;
+          jobs.push({ ps, ms, rank: rank.frame(ms) });
+        }
+      }
+      total += ps.decoded.size;
+    }
+    if (total > DECODED_BUDGET_FRAMES) {
+      // Inactive ranges give their frames back, furthest from the centre first.
+      idle.sort((x, y) => Math.abs(y.ms - w.centre) - Math.abs(x.ms - w.centre));
+      for (const { ps, ms } of idle) {
+        if (total <= DECODED_BUDGET_FRAMES) break;
+        ps.decoded.delete(ms);
+        total--;
+      }
+    }
+    for (const ps of this.products.values()) {
       for (const [a, f] of ps.flows) {
         if (!ps.decoded.has(a) || !ps.decoded.has(f.b) || this.nextOf(ps, a) !== f.b) ps.flows.delete(a);
       }
-      for (const ms of this.frames(ps.p)) {
-        if (!inside(ms) || ps.decoded.has(ms) || ps.loading.has(ms) || ps.failed.has(ms)) continue;
-        jobs.push({ ps, ms, d: Math.abs(ms - w.centre), order: order++ });
-      }
     }
-    jobs.sort((x, y) => x.d - y.d || x.order - y.order);
+    jobs.sort((x, y) => byRank(x.rank, y.rank));
     this.queue = jobs.map(({ ps, ms }) => ({ ps, ms }));
     this.pump();
     this.pumpFlows();
@@ -529,7 +719,7 @@ export class FrameStore extends EventTarget {
       const png = await this.deps.api.fetchFrame(ps.p, msToStamp(ms));
       if (g !== this.gen) return;
       const w = this.window();
-      if (!w || ms < w.start || ms > w.end) return; // the window moved on while it loaded
+      if (!w || !within(this.windowFor(ps, w), ms)) return; // the window moved on while it loaded
       ps.decoded.set(ms, this.deps.decode(png));
       this.emit();
       this.pumpFlows();
@@ -549,22 +739,24 @@ export class FrameStore extends EventTarget {
   }
 
   /**
-   * The wanted pair nearest the focus: adjacent known stamps, both decoded, no flow yet (and no failed
-   * request since the last refresh). Chosen fresh each time, so the "queue" is never stale.
+   * The wanted pair of highest priority (`ranker`): adjacent known stamps of an active product, both
+   * decoded, no flow yet (and no failed request since the last refresh). Chosen fresh each time, so the
+   * "queue" is never stale.
    */
   private nextWantedFlow(): { ps: ProductState; am: number; bm: number } | null {
     const w = this.window();
     if (!w) return null;
-    let best: { ps: ProductState; am: number; bm: number; d: number } | null = null;
+    let best: { ps: ProductState; am: number; bm: number; rank: Rank } | null = null;
     for (const ps of this.products.values()) {
-      if (ps.decoded.size < 2) continue;
+      if (ps.decoded.size < 2 || this.windowFor(ps, w).length === 0) continue; // inactive: no flows
       const fr = this.frames(ps.p);
+      const ranker = this.ranker(ps, w.centre);
       for (let k = 0; k + 1 < fr.length; k++) {
         const am = fr[k]!, bm = fr[k + 1]!;
         if (!ps.decoded.has(am) || !ps.decoded.has(bm)) continue;
         if (ps.flows.get(am)?.b === bm || ps.flowFailed.has(am)) continue;
-        const d = Math.abs((am + bm) / 2 - w.centre);
-        if (!best || d < best.d) best = { ps, am, bm, d };
+        const rank = ranker.pair(am, bm);
+        if (!best || byRank(rank, best.rank) < 0) best = { ps, am, bm, rank };
       }
     }
     return best;
@@ -618,7 +810,9 @@ export class FrameStore extends EventTarget {
     const c = ps.forecast;
     if (c && c.newest === newest && (c.pairs >= flows.length || !a)) return c;
     if (!a || flows.length === 0) return null;
-    ps.forecast = { newest, a, pairs: flows.length, flow: forecastFlow(flows, gaps) };
+    ps.forecast = {
+      newest, a, pairs: flows.length, flow: forecastFlow(flows, gaps), measured: flows.some((f) => f.valid?.includes(1)),
+    };
     return ps.forecast;
   }
 

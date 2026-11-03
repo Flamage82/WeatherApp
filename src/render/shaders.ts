@@ -1,11 +1,13 @@
 import { NOWCAST_MAX_MS } from "../../shared/config";
 import { FORECAST_MIN_OPACITY } from "../motion/interpolate";
+import { DATA_MARGIN_PX } from "../motion/nest";
 
 /**
  * GLSL ES 3.00 sources for the radar layer.
  *
- * INTERP_GLSL is a line-for-line port of `src/motion/interpolate.ts` `sampleInterpolated`,
- * `sampleForecast` and `forecastOpacity`, and `src/motion/flow.ts` `flowAt`. Both bilinear lookups are done by hand with `texelFetch`, not
+ * INTERP_GLSL is a line-for-line port of `src/motion/nest.ts` `edgeDist`, `edgeWeight` and
+ * `nestSlotSample` (as `nestSlot`), `src/motion/interpolate.ts` `bilinear` and `forecastOpacity`, and
+ * `src/motion/flow.ts` `flowAt`. Both bilinear lookups are done by hand with `texelFetch`, not
  * hardware filtering:
  *  - level textures (R8UI): out-of-bounds taps read 0 exactly, which WebGL2 can't express with
  *    wrap modes (no clamp-to-border), and the tap positions match the CPU (value at integer coords);
@@ -101,31 +103,47 @@ vec2 flowAt(highp sampler2D t, ivec2 size, vec2 p) {
   return (v00 * (1.0 - f.x) + v10 * f.x) * (1.0 - f.y) + (v01 * (1.0 - f.x) + v11 * f.x) * f.y;
 }
 
-// THE formula (see interpolate.ts):
-//   F = flowAt(p); wa = A(p - alpha*F); wb = B(p + (1-alpha)*F)
-//   result = min((1-alpha)*wa + alpha*wb, max(wa, wb))
-float sampleInterpolated(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize,
-                         float alpha, vec2 p, int k) {
-  vec2 F = flowAt(fl, fsize, p);
-  float wa = levelAt(a, p - alpha * F, k);
-  float wb = levelAt(b, p + (1.0 - alpha) * F, k);
-  return min((1.0 - alpha) * wa + alpha * wb, max(wa, wb));
-}
-
-// Nowcast (see interpolate.ts sampleForecast): V = flowAt(p) in px/ms; result = A(p - leadMs*V).
-float sampleForecast(highp usampler2D a, highp sampler2D v, ivec2 vsize, float leadMs, vec2 p, int k) {
-  return levelAt(a, p - leadMs * flowAt(v, vsize, p), k);
-}
-
 // interpolate.ts forecastOpacity: 1 at lead 0, fading linearly to FORECAST_MIN_OPACITY at NOWCAST_MAX_MS.
 float forecastOpacity(float leadMs) {
   return 1.0 - ${(1 - FORECAST_MIN_OPACITY).toFixed(4)} * clamp(leadMs / ${NOWCAST_MAX_MS.toFixed(1)}, 0.0, 1.0);
 }
 
-// A slot's level: the nowcast when leadMs > 0, else the A/B interpolation.
-float sampleSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize,
-                 float alpha, float leadMs, vec2 p, int k) {
-  return leadMs > 0.0 ? sampleForecast(a, fl, fsize, leadMs, p, k) : sampleInterpolated(a, b, fl, fsize, alpha, p, k);
+// nest.ts edgeDist: px inside the data area (the frame minus its no-data border), from pixel edges;
+// negative outside.
+float edgeDist(vec2 p) {
+  const float lo = ${(DATA_MARGIN_PX - 0.5).toFixed(1)};
+  const float hi = ${(511.5 - DATA_MARGIN_PX).toFixed(1)};
+  return min(min(p.x - lo, hi - p.x), min(p.y - lo, hi - p.y));
+}
+
+// nest.ts edgeWeight: 0 outside; band 0 = hard edge; else smoothstep across the band.
+float edgeWeight(float d, float band) {
+  if (d < 0.0) return 0.0;
+  if (band == 0.0) return 1.0;
+  float t = clamp(d / band, 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// THE nested-range formula, nest.ts nestSlotSample: (level, weight) of one slot at its own pixel p.
+// lead > 0: nowcast; fl is the motion field in the motion grid's px/ms and maff = (sx, ox, sy, oy)
+// maps this slot's px to the motion grid's px. Else A/B interpolation by the A->B flow fl:
+//   F = flowAt(p); wa = A(p - alpha*F); wb = B(p + (1-alpha)*F); min((1-alpha)*wa + alpha*wb, max(wa, wb)).
+// The weight is the smallest edge weight over p and the source point(s).
+vec2 nestSlot(highp usampler2D a, highp usampler2D b, highp sampler2D fl, ivec2 fsize, float alpha, float lead,
+              vec2 p, int k, float band, vec4 maff) {
+  float w = edgeWeight(edgeDist(p), band);
+  if (w <= 0.0) return vec2(0.0, 0.0);
+  if (lead > 0.0) {
+    vec2 v = flowAt(fl, fsize, vec2(maff.x * p.x + maff.y, maff.z * p.y + maff.w));
+    vec2 s = vec2(p.x - (lead * v.x) / maff.x, p.y - (lead * v.y) / maff.z);
+    w = min(w, edgeWeight(edgeDist(s), band));
+    return vec2(levelAt(a, s, k), w);
+  }
+  vec2 f = flowAt(fl, fsize, p);
+  vec2 pa = p - alpha * f, pb = p + (1.0 - alpha) * f;
+  w = min(w, min(edgeWeight(edgeDist(pa), band), edgeWeight(edgeDist(pb), band)));
+  float wa = levelAt(a, pa, k), wb = levelAt(b, pb, k);
+  return vec2(min((1.0 - alpha) * wa + alpha * wb, max(wa, wb)), w);
 }
 `;
 
@@ -140,11 +158,18 @@ void main() {
 }
 `;
 
+/** Slots in the fragment shader (ranges drawn in one pass); radarLayer.ts MAX_SLOTS. */
+export const SHADER_SLOTS = 4;
+
+const perSlot = (f: (i: number) => string) => Array.from({ length: SHADER_SLOTS }, (_, i) => f(i)).join("\n");
+
 /**
- * Two "slots" so one pass can crossfade between two ranges (slot 1 is skipped while u_mix == 0).
- * Per slot: gnomonic tangent point (radians), image extent in tangent-plane units, the A/B level
+ * Up to SHADER_SLOTS ranges ("slots") nested in one pass, finest first: nest.ts `sampleNested`.
+ * Per slot i: gnomonic tangent point (radians), image extent in tangent-plane units, the A/B level
  * textures, the A->B flow texture and the blend position alpha; or, with u_lead > 0, the nowcast:
- * A = the newest frame, the flow texture = the forecast flow (px/ms), drawn faded with lead time.
+ * A = the newest frame, the flow texture = the motion field (px/ms in the motion grid, mapped by
+ * u_maff), drawn faded with lead time. u_band = edge blend band (BLEND_PX), u_on = 0 absent,
+ * 1 fresh, 2 stale (drawn only where no fresh slot has data, the finest first).
  */
 export const FRAGMENT_SHADER = /* glsl */ `#version 300 es
 precision highp float;
@@ -156,15 +181,17 @@ ${INTERP_GLSL}
 
 const float PI = 3.141592653589793;
 
-uniform highp usampler2D u_a0, u_b0, u_a1, u_b1;
-uniform highp sampler2D u_flow0, u_flow1;
-uniform ivec2 u_flowSize0, u_flowSize1;
-uniform float u_alpha0, u_alpha1;
-uniform float u_lead0, u_lead1;      // nowcast lead (ms) past A; 0 = interpolate A/B
-uniform int u_cell0, u_cell1;        // native cell size k (CELL_SIZE[product])
-uniform vec2 u_centre0, u_centre1;   // (lat0, lon0) radians
-uniform vec4 u_extent0, u_extent1;   // (xMin, xMax, yMin, yMax)
-uniform float u_mix;                 // 0 = all slot 0, 1 = all slot 1
+${perSlot((i) => `uniform highp usampler2D u_a${i}, u_b${i};
+uniform highp sampler2D u_flow${i};
+uniform ivec2 u_flowSize${i};
+uniform float u_alpha${i};
+uniform float u_lead${i};      // nowcast lead (ms) past A; 0 = interpolate A/B
+uniform int u_cell${i};        // native cell size k (CELL_SIZE[product])
+uniform vec2 u_centre${i};     // (lat0, lon0) radians
+uniform vec4 u_extent${i};     // (xMin, xMax, yMin, yMax)
+uniform float u_band${i};      // edge blend band, px (BLEND_PX[product])
+uniform vec4 u_maff${i};       // slot px -> motion px: (sx, ox, sy, oy)
+uniform int u_on${i};          // 0 = absent, 1 = fresh, 2 = stale`)}
 uniform sampler2D u_lut;             // 256 x 1 RGBA8, LINEAR
 
 in vec2 v_merc;
@@ -182,8 +209,6 @@ vec2 gnomonicUV(vec2 lonLat, vec2 centre, vec4 ext) {
   return vec2((x - ext.x) / (ext.y - ext.x), (ext.w - y) / (ext.w - ext.z));
 }
 
-bool inside(vec2 uv) { return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0; }
-
 // Premultiplied ramp colour of a level; LUT entry i holds level i/255*15.
 vec4 ramp(float level) {
   vec4 c = texture(u_lut, vec2((clamp(level, 0.0, 15.0) * 17.0 + 0.5) / 256.0, 0.5));
@@ -192,25 +217,31 @@ vec4 ramp(float level) {
 
 void main() {
   vec2 lonLat = vec2(v_merc.x * 2.0 * PI - PI, atan(sinh(PI * (1.0 - 2.0 * v_merc.y))));
-  vec4 col = vec4(0.0);
-  bool hit = false;
-  if (u_mix < 1.0) {
-    vec2 uv = gnomonicUV(lonLat, u_centre0, u_extent0);
-    if (inside(uv)) {
-      hit = true;
-      float l = sampleSlot(u_a0, u_b0, u_flow0, u_flowSize0, u_alpha0, u_lead0, uv * 512.0 - 0.5, u_cell0);
-      col += (1.0 - u_mix) * forecastOpacity(u_lead0) * ramp(l);
+  // nest.ts sampleNested: fresh slots blend by weight, c = rem*w; the finest stale slot with data
+  // is the fallback where no fresh slot has any. Once rem reaches 0 nothing coarser can show.
+  float rem = 1.0, level = 0.0, opSum = 0.0, cSum = 0.0;
+  bool stale = false;
+  float staleLevel = 0.0, staleOp = 0.0;
+${perSlot((i) => `  if (rem > 0.0 && (u_on${i} == 1 || (u_on${i} == 2 && !stale))) {
+    vec2 r = nestSlot(u_a${i}, u_b${i}, u_flow${i}, u_flowSize${i}, u_alpha${i}, u_lead${i},
+                      gnomonicUV(lonLat, u_centre${i}, u_extent${i}) * 512.0 - 0.5, u_cell${i}, u_band${i}, u_maff${i});
+    if (r.y > 0.0) {
+      float op = forecastOpacity(u_lead${i});
+      if (u_on${i} == 2) {
+        stale = true; staleLevel = r.x; staleOp = op;
+      } else {
+        float c = rem * r.y;
+        level += c * r.x; opSum += c * op; cSum += c;
+        rem *= 1.0 - r.y;
+      }
     }
-  }
-  if (u_mix > 0.0) {
-    vec2 uv = gnomonicUV(lonLat, u_centre1, u_extent1);
-    if (inside(uv)) {
-      hit = true;
-      float l = sampleSlot(u_a1, u_b1, u_flow1, u_flowSize1, u_alpha1, u_lead1, uv * 512.0 - 0.5, u_cell1);
-      col += u_mix * forecastOpacity(u_lead1) * ramp(l);
-    }
-  }
-  if (!hit || col.a <= 0.0) discard;
+  }`)}
+  float opacity = 0.0;
+  if (cSum > 0.0) opacity = opSum / cSum;
+  else if (stale) { level = staleLevel; opacity = staleOp; }
+  else discard;
+  vec4 col = opacity * ramp(level);
+  if (col.a <= 0.0) discard;
   fragColor = col;
 }
 `;
